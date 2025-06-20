@@ -1,0 +1,55 @@
+Received: from some.mailserver.com (some.mailserver.com [192.0.2.100])
+	by another.example.net (Postfix) with ESMTP id FGHIJ5678
+	for <recipient@example.org>; Fri, 20 Jun 2025 15:30:00 +0200 (CEST)
+Received: from [198.51.100.150] (helo=phishing-mail.com)
+	by phishing-relay.net with esmtpsa (TLSv1.2)
+	(Exim 4.96)
+	(envelope-from <alert@phishing-mail.com>)
+	id KLMNO1234; Fri, 20 Jun 2025 15:29:00 +0200
+From: "Ihre Bank" <service@ihre-bank.de>
+To: "Kunde Name" <kunde@example.org>
+Subject: Wichtige Sicherheitsmitteilung zu Ihrem Online-Banking Konto
+Message-ID: <html-phish-test@phishing-mail.com>
+X-Mailer: Advanced Phisher Tool
+Authentication-Results: example.org; spf=fail (sender IP is 198.51.100.150)
+  smtp.mailfrom=alert@phishing-mail.com; dkim=fail (invalid signature)
+  header.d=ihre-bank.de; dmarc=fail action=reject header.from=ihre-bank.de;
+  compauth=fail reason=001
+Return-Path: <bounces@phishing-mail.com>
+Date: Fri, 20 Jun 2025 15:28:00 +0200
+MIME-Version: 1.0
+Content-Type: multipart/alternative; boundary="----=_boundary_alternative_001"
+
+------=_boundary_alternative_001
+Content-Type: text/plain; charset="UTF-8"
+Content-Transfer-Encoding: quoted-printable
+
+Sehr geehrter Kunde,
+
+Ihre Rechnung ist f=C3=A4llig. Bitte klicken Sie hier, um sie herunterzuladen:
+http://malicious.example.com/invoice_download.php
+
+Oder loggen Sie sich hier ein:
+https://www.bank.com/secure-login/
+
+Wichtiger Hinweis: Ignorieren Sie diese E-Mail nicht.
+
+Mit freundlichen Gr=C3=BC=C3=9Fen,
+Ihre Bank
+(Diese E-Mail ist nur zu Testzwecken und enth=C3=A4lt HTML-Verlinkungen, die getestet werden sollen.)
+
+------=_boundary_alternative_001
+Content-Type: text/html; charset="UTF-8"
+Content-Transfer-Encoding: base64
+
+PHA+U2VociBnZWVocnRlciBLdW5kZSw8L3A+PHA+SWhyZSBSZWNobnVuZyBpc3Qg
+ZsOkbGxpZy4gQml0dGUga2xpY2tlbiB SieoaWVyLCB1bSBzaWUgZXJ1bnRlcmxh
+ZGVuOjwvYD48cD48YSBocmVmPSJodHRwOi8vbWFsaWNpb3VzLmV4YW1wbGUuY29t
+L2ludm9pY2VfZG93bmxvYWQucGhwIj5Eb3dubG9hZCBJaHJlciBSZWNobnVuZyBo
+aWVyPC9hPjxwPk9kZXIgbG9nZ2VuIFNpZSBoaWVyIGVpbjowL3A+PHA+PGEgaHJl
+Zj0iaHR0cDovL2xvZ2luLnBoaXNoaW5nLm5ldC9zZWN1cmUiPmh0dHBzOi8vd3d3
+LmJhbmsuY29tL3NlY3VyZS1sb2dpbi88L2E+PC9wPjxpZzggc3JjPSJodHRwOi8v
+dHJhY2tpbmcuZXhhbXBsZS5jb20vcGl4ZWwuZ2lmIiBzdHlsZT0iZGlzcGxheTpu
+b25lOyIvPg==
+
+------=_boundary_alternative_001--

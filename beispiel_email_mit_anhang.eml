@@ -1,0 +1,60 @@
+Received: from mail.example.com (mail.example.com [192.0.2.1])
+	by another.example.net (Postfix) with ESMTP id ABCDEF123
+	for <recipient@example.org>; Fri, 20 Jun 2025 14:00:00 +0200 (CEST)
+Received: from [198.51.100.1] (helo=sender.example.net)
+	by mail.example.com with esmtpsa (TLSv1.2:AES256-GCM-SHA384)
+	(Exim 4.96)
+	(envelope-from <sender@example.net>)
+	id GHIJKL456; Fri, 20 Jun 2025 13:59:00 +0200
+From: "Service Updates" <noreply@updates.com>
+To: "User Name" <user@example.org>
+Subject: Important: Your Service Account Update and Invoice
+Message-ID: <email-with-attachments@example.net>
+X-Mailer: Custom Mailer V2
+Authentication-Results: example.net; spf=pass (sender IP is 198.51.100.1)
+  smtp.mailfrom=noreply@updates.com; dkim=pass (signature verified)
+  header.d=updates.com; dmarc=pass action=none header.from=updates.com;
+  compauth=pass reason=100
+Return-Path: <noreply@updates.com>
+Date: Fri, 20 Jun 2025 13:58:00 +0200
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="----=_Boundary_001_AABBCC"
+
+------=_Boundary_001_AABBCC
+Content-Type: text/plain; charset="UTF-8"
+Content-Transfer-Encoding: quoted-printable
+
+Dear User,
+
+Please find attached your updated service document and a critical security update.
+We recommend you review them carefully.
+
+Your latest invoice is also attached.
+
+Thank you,
+The Service Team
+
+------=_Boundary_001_AABBCC
+Content-Type: text/plain; name="document.txt"
+Content-Transfer-Encoding: base64
+Content-Disposition: attachment; filename="document.txt"
+
+VGhpcyBpcyBhIHRlc3QgZG9jdW1lbnQuIFRoaXMgaXMgYSBzYWZlIGF0dGFjaG1lbnQu
+IEl0IGNvbnRhaW5zIG5vIG1hbGljaW91cyBjb2RlLg==
+
+------=_Boundary_001_AABBCC
+Content-Type: application/octet-stream; name="update.exe"
+Content-Transfer-Encoding: base64
+Content-Disposition: attachment; filename="update.exe"
+
+VGhpcyBpcyBhIGR1bW15IGV4ZWN1dGFibGUgZmlsZS4gSXQgaXMgc2FmZSB0byBoYW5k
+bGUgYXMgaXQgZG9lcyBub3QgY29udGFpbiBhbnkgYWN0dWFsIGNvZGUu
+
+------=_Boundary_001_AABBCC
+Content-Type: application/vnd.ms-excel.sheet.macroEnabled.12; name="invoice.xlsm"
+Content-Transfer-Encoding: base64
+Content-Disposition: attachment; filename="invoice.xlsm"
+
+UGl0YWxsIGlzIGEgZHVtbXkgbWljcm8tZW5hYmxlZCBleGNlbCBmaWxlLg==
+
+------=_Boundary_001_AABBCC--
