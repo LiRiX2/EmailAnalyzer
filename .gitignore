@@ -1,29 +1,21 @@
-# PyCharm spezifische Dateien
+ IDE
 .idea/
-venv/
-*.iml
-
-# Python Artefakte
+.vscode/
+ 
+# Runtime output - extracted attachments may include malicious samples
+attachments_extracted/
+ 
+# Analysis exports (often contain case-specific data)
+*_analysis.json
+ 
+# Python
 __pycache__/
 *.pyc
-.Python
-build/
-dist/
+.venv/
+venv/
 *.egg-info/
-.ipynb_checkpoints/
-.mypy_cache/
-.pytest_cache/
-
-# Daten/Anhänge, die nicht hochgeladen werden sollen
-attachments_extracted/  # Wichtig: Speichert Ihre extrahierten Anhänge
-*.eml                 # Beispiel-E-Mails nicht hochladen, wenn sie private Daten enthalten könnten
-*.json                # Analyseergebnisse nicht hochladen
-*.log                 # Log-Dateien
-*.db                  # Datenbanken
-
-# API-Keys oder sensible Daten (falls später hinzugefügt)
-*.env
-*.ini
-*.key
-*.pem
-credentials.json
+ 
+# OS
+.DS_Store
+Thumbs.db
+ 
