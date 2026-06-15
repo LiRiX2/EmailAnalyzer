@@ -1,101 +1,118 @@
 # Email Analyzer
 
-A comprehensive Python script designed to assist in the analysis of suspicious email messages. This tool parses email headers, extracts and evaluates URLs, identifies and analyzes attachments, and provides a consolidated risk assessment to help in the detection of phishing, malware, and spoofing attempts.
+A Python tool for analyzing suspicious email messages (`.eml`). It parses headers, evaluates sender authenticity, extracts and scores URLs (including obfuscated links in HTML), analyzes attachments for executables and malicious Office macros, and produces a consolidated risk score — with full JSON export for case records.
 
-## ✨ Features
+Built around a SOC triage workflow: feed it a reported email, get back a structured verdict you can act on or attach to a ticket.
 
-* **Interactive File Selection:** Easily select any `.eml` file for analysis at runtime.
-* **Detailed Header Analysis:**
-    * Extracts critical headers (From, To, Subject, Message-ID, X-Mailer).
-    * Clearly distinguishes between **Visual Sender** (what the user sees) and **Truth Sender** (actual originating IP and Return-Path domain).
-    * Displays SPF, DKIM, and DMARC authentication results.
-    * Prominent **Spoofing Detection** based on authentication failures.
-* **IP Geolocation & Blacklist Check:** Provides geographical information and a basic blacklist status for the originating IP address.
-* **Subject Keyword Detection:** Identifies suspicious keywords in the email subject line.
-* **Advanced URL Analysis:**
-    * Extracts URLs from both plain text and **HTML email bodies**.
-    * Identifies obscured or hidden URLs within HTML elements (`<a>` with deceptive text, `<img>`, `<iframe>`, CSS `url()`).
-    * Applies **heuristic scoring and verdicts** based on patterns (e.g., IP addresses as domain, long query parameters, suspicious keywords in path/query).
-    * Retrieves WHOIS information for extracted domains (creation date, registrar, contact emails).
-    * Includes placeholders for integration with external APIs like VirusTotal and Google Safe Browse (API keys not used in this public version).
-* **Attachment Analysis:**
-    * Extracts and securely saves attachments to a local directory (`attachments_extracted/`).
-    * Calculates MD5, SHA1, and SHA256 hashes for each attachment.
-    * Performs **static analysis** to detect executable files, script files, and **VBA macros in Office documents (using `oletools`)**. Detects auto-executing macros.
-    * Includes placeholders for VirusTotal file hash lookups.
-* **Consolidated Risk Assessment:** Provides an overall risk score and verdict based on all detected indicators.
-* **Structured JSON Export:** Option to export the full analysis results into a well-formatted JSON file for archiving or further processing.
-* **Clear Console Output:** Designed for readability and quick identification of critical information.
+## Features
 
-## 🚀 Getting Started
+**Header & sender authenticity**
+- Extracts core headers (From, To, Subject, Message-ID, X-Mailer) and the originating IP from the `Received` chain.
+- **Visual vs. Truth Sender**: programmatically compares the From-header domain against the Return-Path domain to flag mismatches — independent of any authentication headers.
+- **Authentication-Results with a trust boundary**: `SPF`/`DKIM`/`DMARC` results are only used for the spoofing verdict if the `Authentication-Results` header was added by a configured, trusted receiving MTA (`authserv-id`). This prevents an attacker-forged `Authentication-Results: ...; spf=pass; dkim=pass; dmarc=pass` header in the raw message from producing a false "clean" verdict.
+- Geo-IP and basic blacklist status for the originating IP.
+- Subject-line keyword detection (word-boundary matching to avoid false positives like "Win" in "showing").
+
+**URL analysis**
+- Extracts URLs from plain-text and HTML bodies, including `<a>`, `<img>`, `<script>`, `<iframe>`, `<link>`, and CSS `url()`.
+- **Deceptive link detection**: flags links where the displayed text is itself a URL pointing to a different domain than the actual `href` — a common phishing pattern.
+- Heuristic scoring: IP-as-domain, oversized query strings, credential/brand-related keywords in path or query.
+- WHOIS lookups, including a "very young domain" check (domains registered within the last 30 days).
+- Placeholders for VirusTotal and Safe Browsing API integration (no keys used in this public version).
+
+**Attachment analysis**
+- Extracts attachments to `attachments_extracted/` and computes MD5, SHA1, SHA256.
+- Static analysis: flags executables, scripts, and Office documents.
+- VBA macro analysis via `oletools`, including detection of auto-executing macros (`AutoOpen`, `Workbook_Open`, etc.).
+
+**Risk assessment & export**
+- Consolidated risk score and verdict (Low → Critical), combining all of the above.
+- The risk assessment is part of the returned data structure — **it's included in the JSON export**, not just printed to console.
+- Optional opsec mode: disable all external lookups (Geo-IP, WHOIS) so indicators are never sent to third parties during sensitive investigations.
+
+## Getting Started
 
 ### Prerequisites
 
-* Python 3.x installed on your system.
-* `pip` (Python package installer) for dependency management.
+- Python 3.9+
+- `pip`
 
 ### Installation
 
-1.  **Clone the repository** (or download the ZIP and extract it) to your local machine:
-    ```bash
-    git clone [https://github.com/YourGitHubUsername/EmailAnalyzer.git](https://github.com/YourGitHubUsername/EmailAnalyzer.git)
-    cd EmailAnalyzer
-    ```
-    *(Replace `YourGitHubUsername` with your actual GitHub username)*
-
-2.  **Install the required Python libraries:**
-    ```bash
-    pip install -r requirements.txt
-    ```
-    *(Note: You'll need to create `requirements.txt` as described below)*
-
-### Creating `requirements.txt`
-
-In the root directory of your project (where `email_analyzer.py` is), create a file named `requirements.txt` and add the following lines:
-requests
-python-whois
-beautifulsoup4
-python-dateutil
-oletools
+```bash
+git clone https://github.com/LiRiX2/EmailAnalyzer.git
+cd EmailAnalyzer
+pip install -r requirements.txt
+```
 
 ### Usage
 
-1.  **Run the script:**
-    ```bash
-    python email_analyzer.py
-    ```
+```bash
+python email_analyzer.py
+```
 
-2.  **Follow the prompts:**
-    The script will ask you to enter the full path to the `.eml` file you want to analyze.
-    * **Example (Windows):** `C:\Users\YourUser\Desktop\suspicious_email.eml`
-    * **Example (macOS/Linux):** `/home/youruser/emails/suspicious_email.eml`
-    * *(You can often drag and drop the `.eml` file into the terminal window to get its path.)*
+The script prompts for the path to a `.eml` file (drag-and-drop the file into the terminal to insert its path), runs the analysis, prints a structured report, and offers to export the full results to JSON.
 
-3.  **Review the analysis:** The results will be displayed in your console.
-4.  **Export to JSON:** After the analysis, you'll be prompted if you wish to export the full results to a JSON file.
+### Configuration
 
-### 🧪 Testing
+Both are environment variables, set before running the script.
 
-To test the full capabilities of the analyzer, you can create sample `.eml` files:
+| Variable | Default | Purpose |
+|---|---|---|
+| `EMAILANALYZER_TRUSTED_AUTHSERV_ID` | _(empty)_ | The `authserv-id` of your receiving MTA (e.g. `mx.example.com`). If unset, `Authentication-Results` is treated as untrusted and excluded from the spoofing verdict — only the Visual-vs-Truth domain comparison is used. |
+| `EMAILANALYZER_EXTERNAL_LOOKUPS` | `1` | Set to `0` to disable Geo-IP and WHOIS lookups (opsec mode). |
 
-* **Download an original email:** Most email clients allow you to "Show Original" or "Download Original" of an email, saving it as a `.eml` file.
-* **Craft a test email:**
-    * **For HTML analysis:** Send yourself an email via Gmail/Outlook.com with deliberately crafted HTML links (e.g., `<a>` tags where the displayed text differs from the actual `href` URL, or `<img>` tags with suspicious `src`). Then download its original `.eml`.
-    * **For attachment analysis:** Attach a dummy `test.txt`, a renamed `dummy.exe` (a text file renamed to `.exe`), and a macro-enabled Office document (`.docm` or `.xlsm`) containing a safe test macro (e.g., a simple `MsgBox` in `Sub AutoOpen()` or `Sub Workbook_Open()`). Send it to yourself and download the original `.eml`.
+Example:
+```bash
+EMAILANALYZER_TRUSTED_AUTHSERV_ID=mx.mycompany.com python email_analyzer.py
+```
 
-### 💡 Future Enhancements
+## Sample Output
 
-* **API Key Integration:** Implement actual calls to VirusTotal and Google Safe Browse APIs (requires obtaining API keys and managing quotas).
-* **Advanced HTML Parsing:** Deeper analysis of JavaScript obfuscation and CSS-based phishing techniques.
-* **Batch Processing:** Add functionality to analyze multiple `.eml` files within a directory.
-* **GUI (Graphical User Interface):** Develop a simple desktop UI for easier interaction.
+```
+--- Header Information ---
+Visual Sender (From):                   "Microsoft 365" <no-reply@microsoft.com>
+Truth Sender Domain (Return-Path):      m365-secure-login.com
+Truth Sender (Originating IP):          203.0.113.45
+------------------------------------------------------------
+Auth authserv-id:                       attacker-forged.example
+  SPF:                                  pass
+  DKIM:                                 pass
+  DMARC:                                pass
+  Trust: Authentication-Results NOT trusted - set TRUSTED_AUTHSERV_ID to your
+         boundary MTA. SPF/DKIM/DMARC values below are informational only and
+         excluded from the spoofing verdict.
+------------------------------------------------------------
+!!! SPOOFING DETECTED !!!               YES
+    - From domain (microsoft.com) != Return-Path domain (m365-secure-login.com)
 
-## ✍️ Author
+--- HTML / Deceptive Link Findings ---
+  - Deceptive link: text shows 'login.microsoftonline.com' but links to 'm365-secure-login.com'
 
-* **Tobias Kastenhuber / LiRiX2**
+Overall Risk Score: 8
+Verdict: HIGH to CRITICAL Risk. Highly suspicious or malicious - extreme caution.
+```
 
-## 📄 License
+Note how the email passes SPF/DKIM/DMARC at face value — those values were forged in the raw message and originate from an untrusted `authserv-id`, so the tool correctly excludes them from the verdict and instead catches the spoofing via domain alignment and the deceptive link.
 
-This project is licensed under the MIT License - see the `LICENSE` file for details (you can create this file separately on GitHub or in your project root).
+## Testing
 
----
+To build test cases:
+- Use "Show Original" / "Download Original" in your email client to get real `.eml` files.
+- Craft HTML test emails with `<a>` tags where the link text is itself a URL pointing to a different domain.
+- For attachment analysis: attach a renamed `dummy.exe`, and a `.docm`/`.xlsm` with a harmless test macro (`MsgBox` in `Sub AutoOpen()`).
+
+## Future Enhancements
+
+- VirusTotal and Safe Browsing API integration.
+- Deeper HTML/JavaScript obfuscation analysis.
+- Batch processing of multiple `.eml` files.
+- Simple GUI.
+
+## Author
+
+Tobias Kastenhuber ([LiRiX2](https://github.com/LiRiX2))
+
+## License
+
+MIT License — see `LICENSE` for details.
