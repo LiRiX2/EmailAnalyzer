@@ -5,11 +5,12 @@ import re
 import requests
 import whois  # Benötigt: pip install python-whois
 from urllib.parse import urlparse  # Hilft beim Zerlegen von URLs
-import hashlib  # Neu hinzugefügt für Hash-Berechnungen
-import os  # Neu hinzugefügt für Dateisystemoperationen (Anhänge speichern)
-from datetime import datetime, timedelta  # Für heuristische URL-Analyse (Domain-Alter)
+import hashlib  # Für Hash-Berechnungen
+import os  # Für Dateisystemoperationen (Anhänge speichern)
+from datetime import datetime, timedelta, timezone  # Für heuristische URL-Analyse (Domain-Alter)
 import dateutil.parser  # Benötigt: pip install python-dateutil - für robustes Datums-Parsing
-import traceback  # Neu hinzugefügt für detaillierte Fehlermeldungen
+import traceback  # Für detaillierte Fehlermeldungen
+import logging  # Statt stiller except:pass -> gezieltes Logging
 
 # Oletools für erweiterte Anhangsanalyse
 # Benötigt: pip install oletools
@@ -21,35 +22,47 @@ from oletools.olevba import VBA_Parser  # Für VBA-Makro-Analyse
 from bs4 import BeautifulSoup
 
 # JSON für den Export der Ergebnisse
-import json  # Neu hinzugefügt für JSON-Export
+import json
+
+# --- Logging ---
+logging.basicConfig(level=logging.WARNING, format="%(levelname)s: %(message)s")
+logger = logging.getLogger("email_analyzer")
 
 # --- Konfiguration ---
 # Pfad, unter dem Anhänge gespeichert werden sollen (relativ zum Skript)
 ATTACHMENT_SAVE_DIR = "attachments_extracted"
+
+# Opsec: Externe Lookups (Geo-IP, WHOIS) senden Indikatoren an Dritte.
+# Über Umgebungsvariable steuerbar; Default = aktiviert.
+#   EMAILANALYZER_EXTERNAL_LOOKUPS=0  -> deaktiviert (keine Daten an Dritte)
+ENABLE_EXTERNAL_LOOKUPS = os.environ.get("EMAILANALYZER_EXTERNAL_LOOKUPS", "1") != "0"
+
+# Vertrauensgrenze für Authentication-Results (RFC 8601):
+# Nur der A-R-Header der EIGENEN, empfangenden MTA ist vertrauenswürdig - ein Angreifer
+# kann in der rohen Mail beliebige A-R-Header faelschen. Trage hier die authserv-id eurer
+# empfangenden MTA ein (z. B. "mx.example.com"). Bleibt das leer, werden A-R-Header als
+# NICHT vertrauenswürdig behandelt und fliessen nicht in den Spoofing-Verdict ein.
+TRUSTED_AUTHSERV_ID = os.environ.get("EMAILANALYZER_TRUSTED_AUTHSERV_ID", "")
 
 
 # --- Hilfsfunktionen für IP- und Keyword-Analyse ---
 
 def get_geo_ip_info(ip_address):
     """
-    Ruft Geo-IP-Informationen für eine gegebene IP-Adresse ab.
-    Verwendet die öffentliche API von ip-api.com.
-
-    Args:
-        ip_address (str): Die IP-Adresse, die überprüft werden soll.
-
-    Returns:
-        dict: Ein Wörterbuch mit Geo-IP-Informationen (Land, Stadt, ISP) oder None bei Fehler.
+    Ruft Geo-IP-Informationen für eine gegebene IP-Adresse ab (ip-api.com).
+    Wird nur ausgeführt, wenn externe Lookups erlaubt sind (Opsec).
     """
+    if not ENABLE_EXTERNAL_LOOKUPS:
+        return None
     if not ip_address or ip_address == "No IP found in Received Header":
         return None
 
-    # ip-api.com ist kostenlos für nicht-kommerzielle Nutzung und hat ein Rate Limit (45 Anfragen/Minute).
-    # Für produktive Umgebungen ggf. auf eine kostenpflichtige API oder eine lokale GeoLite2-Datenbank umsteigen.
+    # Hinweis: Der kostenlose ip-api.com-Endpunkt ist nur über HTTP verfügbar
+    # (kein TLS). Für produktive Nutzung lokale GeoLite2-DB oder bezahlte HTTPS-API.
     url = f"http://ip-api.com/json/{ip_address}"
     try:
-        response = requests.get(url, timeout=5)  # Timeout von 5 Sekunden, um Hängenbleiben zu vermeiden
-        response.raise_for_status()  # Löst einen HTTPError für schlechte Antworten (4xx oder 5xx) aus
+        response = requests.get(url, timeout=5)
+        response.raise_for_status()
         data = response.json()
 
         if data and data.get('status') == 'success':
@@ -59,23 +72,22 @@ def get_geo_ip_info(ip_address):
                 'isp': data.get('isp')
             }
         else:
-            print(f"Geo-IP-API-Error for {ip_address}: {data.get('message', 'Unknown error')}")
+            logger.warning("Geo-IP-API error for %s: %s", ip_address, data.get('message', 'Unknown error'))
             return None
     except requests.exceptions.RequestException as e:
-        print(f"Error during Geo-IP query for {ip_address}: {e}")
+        logger.warning("Error during Geo-IP query for %s: %s", ip_address, e)
         return None
 
 
 def check_ip_blacklist(ip_address):
     """
-    Führt einen (vereinfachten) Blacklist-Check für eine gegebene IP-Adresse durch.
-    Dies ist ein Platzhalter für eine erweiterte Implementierung mit externen APIs.
+    Vereinfachter Blacklist-Check (Platzhalter für eine echte RBL/Threat-Intel-Anbindung).
     """
     if not ip_address or ip_address == "No IP found in Received Header":
         return "N/A"
 
     if ip_address == "192.0.2.1":
-        return "Known Test IP (Highly Suspicious)"  # Dies ist eine reservierte Test-IP
+        return "Known Test IP (Highly Suspicious)"  # reservierte Test-IP (RFC 5737)
     elif ip_address.startswith("192.168.") or ip_address.startswith("10.") or ip_address.startswith("172.16."):
         return "Private IP (Internal Network, Not Publicly Routable)"
     elif ip_address.startswith("1.2.3."):
@@ -86,23 +98,16 @@ def check_ip_blacklist(ip_address):
 
 def search_keywords_in_subject(subject, keywords):
     """
-    Sucht nach verdächtigen Keywords im E-Mail-Betreff.
-
-    Args:
-        subject (str): Der Betreff der E-Mail.
-        keywords (list): Eine Liste von Keywords, nach denen gesucht werden soll.
-
-    Returns:
-        list: Eine Liste der gefundenen Keywords. Gibt eine leere Liste zurück, wenn keine gefunden wurden.
+    Sucht nach verdächtigen Keywords im Betreff - mit Wortgrenzen, um
+    Substring-Fehltreffer zu vermeiden (z. B. "Win" in "showing").
     """
     if not subject:
         return []
 
     found_keywords = []
-    # Konvertiere den Betreff zu Kleinbuchstaben für eine case-insensitive Suche
     subject_lower = subject.lower()
     for keyword in keywords:
-        if keyword.lower() in subject_lower:
+        if re.search(r'\b' + re.escape(keyword.lower()) + r'\b', subject_lower):
             found_keywords.append(keyword)
     return found_keywords
 
@@ -111,32 +116,29 @@ def search_keywords_in_subject(subject, keywords):
 
 def extract_urls_from_text(text):
     """
-    Extrahiert URLs aus einem gegebenen Text.
-    Verwendet einen regulären Ausdruck, der HTTP(S)-URLs, FTP, file://, etc. erkennt.
+    Extrahiert URLs aus einem Text. Bewusst einfacher, robuster Regex
+    (greift alles ab dem Schema bis zum nächsten Whitespace/Trennzeichen).
     """
-    # Verbesserter Regex für URLs: erkennt http/https/ftp/file Schemas
-    # und einfache Domains/IPs mit Pfaden
+    if not text:
+        return []
     url_pattern = re.compile(
-        r'(?:https?|ftp|file)://'  # Protokoll
-        r'(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+'  # Domain/IP und Pfad
-        r'(?:\.(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+)*'  # Weitere Domainteile
-        r'(?:/[a-zA-Z0-9$-_@.&+!*\\(\\),%]*)*/?'  # Optionale Pfade
-        r'(?:\?[a-zA-Z0-9$-_@.&+!*\\(\\),%=\?:]*)?'  # Optionale Query-Parameter
-        r'(?:#[a-zA-Z0-9$-_@.&+!*\\(\\),%:]*)?'  # Optionaler Fragment-Identifier
+        r'(?:https?|ftp|file)://'      # Schema
+        r'[^\s<>"\')\]]+',             # bis zum nächsten Whitespace / schliessenden Zeichen
+        re.IGNORECASE
     )
-    return url_pattern.findall(text)
+    # Häufige nachlaufende Satzzeichen abschneiden
+    return [u.rstrip('.,);\'"') for u in url_pattern.findall(text)]
 
 
 def get_whois_info(domain):
     """
-    Ruft WHOIS-Informationen für eine gegebene Domain ab.
-    Benötigt die 'python-whois' Bibliothek.
+    Ruft WHOIS-Informationen ab. Nur bei erlaubten externen Lookups (Opsec).
     """
+    if not ENABLE_EXTERNAL_LOOKUPS:
+        return None
     try:
         w = whois.whois(domain)
-        # whois-Objekt kann None sein, wenn keine Daten gefunden wurden
         if w:
-            # Einige nützliche WHOIS-Felder
             return {
                 'domain_name': w.domain_name,
                 'registrar': w.registrar,
@@ -147,153 +149,101 @@ def get_whois_info(domain):
             }
         return None
     except Exception as e:
-        # print(f"Error during WHOIS query for {domain}: {e}") # For debugging
+        logger.debug("WHOIS query failed for %s: %s", domain, e)
         return None
 
 
 def analyze_url_for_suspicious_patterns(url):
     """
     Analysiert eine URL auf verdächtige Muster und weist einen Risikowert zu.
-    Die zurückgegebenen Strings sind prägnanter für die Ausgabe.
     """
     suspicious_patterns = []
-    url_score = 0  # NEU: Initialisiere den Score für diese URL
+    url_score = 0
 
     parsed_url = urlparse(url)
-    domain = parsed_url.netloc
-    path = parsed_url.path
-    query = parsed_url.query
+    # hostname() entfernt Port und Userinfo -> robuster als netloc
+    host = parsed_url.hostname or ""
+    path = parsed_url.path or ""
+    query = parsed_url.query or ""
 
-    # 1. IP-Adresse als Domain (z.B. http://192.168.1.1/malicious)
-    if re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$', domain) or \
-            re.match(r'^\[[0-9a-fA-F:]+\]$', domain):  # IPv6
+    # 1. IP-Adresse als Domain (IPv4 oder IPv6-Literal)
+    if re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$', host) or \
+            re.match(r'^[0-9a-fA-F:]+$', host) and ':' in host:
         suspicious_patterns.append("IP as domain")
-        url_score += 3  # HOHER RISIKOWERT
+        url_score += 3
 
-    # 2. Sehr langer Query-Parameter (könnte Verschleierung sein)
-    if len(query) > 100:  # Schwellenwert anpassbar
+    # 2. Sehr langer Query-Parameter (mögliche Verschleierung)
+    if len(query) > 100:
         suspicious_patterns.append(f"Long query ({len(query)} chars)")
-        url_score += 2  # MITTLERER RISIKOWERT
+        url_score += 2
 
-    # 3. Keyword in URL-Pfad (z.B. login, update, verify, admin)
+    # 3. Verdächtige Keywords in Pfad/Query
     suspicious_url_keywords = ["login", "update", "verify", "admin", "account", "security", "alert",
                                "bank", "paypal", "invoice", "payment", "support", "amazon", "apple",
                                "microsoft", "icloud", "dropbox", "onedrive"]
     for keyword in suspicious_url_keywords:
-        # Hier fügen wir nur das Keyword hinzu, wenn es gefunden wird
-        if keyword.lower() in path.lower() or keyword.lower() in query.lower():
-            if keyword not in suspicious_patterns:  # Vermeide Duplikate
+        if keyword in path.lower() or keyword in query.lower():
+            if keyword not in suspicious_patterns:
                 suspicious_patterns.append(keyword)
-                url_score += 1  # GERINGERER RISIKOWERT PRO KEYWORD
+                url_score += 1
 
-    # Später hier VirusTotal-Ergebnisse und andere Checks mit weiteren Punkten hinzufügen
-
-    return suspicious_patterns, url_score  # Gib beides zurück
+    return suspicious_patterns, url_score
 
 
 def get_heuristic_url_verdict(url_entry):
     """
-    Gibt eine heuristische Einschätzung des URL-Risikos basierend auf dem Score
-    und WHOIS-Informationen (ohne externe API-Abfragen wie VirusTotal).
-
-    Args:
-        url_entry (dict): Ein Wörterbuch mit der URL-Analyse (inkl. url_score, whois_info).
-
-    Returns:
-        str: Eine heuristische Einschätzung wie "Malicious (Heuristic)", "Suspicious (Heuristic)", "Potentially Clean (Heuristic)".
+    Heuristische Einschätzung des URL-Risikos (Score + WHOIS), ohne externe Reputations-APIs.
     """
     score = url_entry.get('url_score', 0)
     whois_info = url_entry.get('whois_info')
 
-    # Höchste Priorität: IP-Adresse als Domain
     if "IP as domain" in url_entry.get('suspicious_patterns', []):
         return "Malicious (IP as domain - Heuristic)"
 
-    # Hoher Score deutet auf hohe Verdächtigkeit hin
-    if score >= 3:  # Beispiel-Schwellenwert
+    if score >= 3:
         return "Malicious (High Score - Heuristic)"
     elif score >= 1:
         return "Suspicious (Medium Score - Heuristic)"
 
-    # Analyse basierend auf WHOIS-Daten, wenn verfügbar
     if isinstance(whois_info, dict):
         creation_date = whois_info.get('creation_date')
-        if isinstance(creation_date, list):  # WHOIS-Datum kann als Liste zurückkommen
+        if isinstance(creation_date, list):
             creation_date = creation_date[0] if creation_date else None
 
         if creation_date:
             try:
-                # Versuche, das Datum zu parsen. dateutil.parser ist robuster.
                 parsed_creation_date = dateutil.parser.parse(str(creation_date))
-
-                # Überprüfe, ob Domain sehr jung ist (z.B. weniger als 30 Tage alt)
-                # Aktuelles Datum berücksichtigen (für dynamische Tests)
-                if datetime.now() - parsed_creation_date < timedelta(days=30):
+                # FIX: naive/aware-Mischfehler vermeiden -> beides auf tz-aware UTC normalisieren
+                if parsed_creation_date.tzinfo is None:
+                    parsed_creation_date = parsed_creation_date.replace(tzinfo=timezone.utc)
+                now = datetime.now(timezone.utc)
+                if now - parsed_creation_date < timedelta(days=30):
                     return "Highly Suspicious (Very Young Domain - Heuristic)"
-            except Exception:
-                pass  # Fehler beim Parsen des Datums ignorieren
+            except (ValueError, OverflowError, TypeError) as e:
+                logger.debug("Could not parse WHOIS creation date '%s': %s", creation_date, e)
 
-    # Wenn nichts Gravierendes gefunden wurde
     if score == 0:
         return "Potentially Clean (Heuristic)"
 
-    return "Unknown (Heuristic)"  # Falls ein Score, aber keine spezifische Regel zutrifft
+    return "Unknown (Heuristic)"
 
 
-def check_url_google_safe_Browse(url, api_key=None):
+def check_url_google_safe_browsing(url, api_key=None):
     """
-    Platzhalter für die Abfrage der Google Safe Browse API.
-    Benötigt einen API-Key und eine tatsächliche Implementierung.
-
-    Args:
-        url (str): Die zu überprüfende URL.
-        api_key (str): Ihr Google Safe Browse API-Key (optional für diesen Platzhalter).
-
-    Returns:
-        str: Scan-Status von Google Safe Browse (z.B. "MALICIOUS", "CLEAN", "SKIPPED").
+    Platzhalter für die Google Safe Browsing API (kein API-Key in der öffentlichen Version).
     """
     if api_key:
-        # Hier würde die tatsächliche API-Anfrage an Google Safe Browse stehen.
-        # Beispiel:
-        # try:
-        #     api_url = f"https://safeBrowse.googleapis.com/v4/threatMatches:find?key={api_key}"
-        #     payload = {
-        #         "client": {"clientId": "your-app-name", "clientVersion": "1.0"},
-        #         "threatInfo": {
-        #             "threatTypes": ["MALWARE", "SOCIAL_ENGINEERING", "UNWANTED_SOFTWARE", "POTENTIELLY_HARMFUL_APPLICATION"],
-        #             "platformTypes": ["ANY_PLATFORM"],
-        #             "threatEntryTypes": ["URL"],
-        #             "threatEntries": [{"url": url}]
-        #         }
-        #     }
-        #     response = requests.post(api_url, json=payload, timeout=10)
-        #     response.raise_for_status()
-        #     threat_matches = response.json().get('matches', [])
-        #     if threat_matches:
-        #         # Hier müsste man die Matches parsen und einen Status zurückgeben
-        #         return f"MALICIOUS (GSB: {threat_matches[0]['threatType']})"
-        #     else:
-        #         return "CLEAN (GSB)"
-        # except requests.exceptions.RequestException as e:
-        #     return f"ERROR (GSB API): {e}"
-        # except Exception as e:
-        #     return f"ERROR (GSB Processing): {e}"
-        return "SKIPPED (Google Safe Browse - API Key available but not implemented)"
+        # Hier würde die tatsächliche API-Anfrage stehen (threatMatches:find).
+        return "SKIPPED (Google Safe Browsing - API key available but not implemented)"
     else:
-        return "SKIPPED (Google Safe Browse - API Key not provided)"
+        return "SKIPPED (Google Safe Browsing - API key not provided)"
 
 
 def export_results_to_json(data, output_filename):
     """
-    Exportiert die Analysedaten in eine JSON-Datei.
-    Konvertiert datetime-Objekte in ISO-formatierte Strings für JSON-Kompatibilität.
-
-    Args:
-        data (dict): Das Wörterbuch mit den Analysedaten.
-        output_filename (str): Der Name der Ausgabedatei (z.B. 'analyse_ergebnisse.json').
+    Exportiert die Analysedaten als JSON. datetime-Objekte werden in ISO-Strings konvertiert.
     """
     try:
-        # Rekursive Funktion, um datetime-Objekte zu konvertieren
         def convert_datetime_to_str(obj):
             if isinstance(obj, datetime):
                 return obj.isoformat()
@@ -306,27 +256,20 @@ def export_results_to_json(data, output_filename):
         serializable_data = convert_datetime_to_str(data)
 
         with open(output_filename, 'w', encoding='utf-8') as f:
-            # indent=4 sorgt für eine schön formatierte, lesbare JSON-Datei
-            # ensure_ascii=False erlaubt nicht-ASCII-Zeichen direkt (z.B. Umlaute),
-            # anstatt sie in Escape-Sequenzen zu konvertieren (\u00fc)
             json.dump(serializable_data, f, indent=4, ensure_ascii=False)
         print(f"\nResults successfully exported to '{output_filename}'")
     except Exception as e:
-        print(f"\nError exporting results to JSON: {e}")
-        traceback.print_exc()  # Für detaillierteres Debugging
+        logger.error("Error exporting results to JSON: %s", e)
+        traceback.print_exc()
 
 
 # --- Funktionen für Dateianhang-Analyse ---
 
 def calculate_file_hashes(file_path):
     """
-    Berechnet MD5, SHA1 und SHA256 Hashes einer Datei.
+    Berechnet MD5, SHA1 und SHA256 einer Datei.
     """
-    hashes = {
-        'md5': '',
-        'sha1': '',
-        'sha256': ''
-    }
+    hashes = {'md5': '', 'sha1': '', 'sha256': ''}
     try:
         with open(file_path, 'rb') as f:
             bytes_content = f.read()
@@ -334,60 +277,52 @@ def calculate_file_hashes(file_path):
             hashes['sha1'] = hashlib.sha1(bytes_content).hexdigest()
             hashes['sha256'] = hashlib.sha256(bytes_content).hexdigest()
     except FileNotFoundError:
-        print(f"Error: File '{file_path}' not found for hash calculation.")
+        logger.error("File '%s' not found for hash calculation.", file_path)
     except Exception as e:
-        print(f"Error calculating hash for {file_path}: {e}")
+        logger.error("Error calculating hash for %s: %s", file_path, e)
     return hashes
 
 
 def analyze_attachment_static(file_path):
     """
-    Führt eine einfache statische Analyse eines Dateianhangs durch.
-    Erweitert um Makro-Analyse für Office-Dokumente mittels oletools.
+    Einfache statische Analyse eines Anhangs, inkl. Makro-Analyse für Office-Dokumente (oletools).
     """
     analysis_results = []
     file_name = os.path.basename(file_path)
-    file_extension = os.path.splitext(file_name)[1].lower()  # Dateiendung extrahieren
+    file_extension = os.path.splitext(file_name)[1].lower()
 
-    # Erkennung von ausführbaren Dateien und Skripten (bestehend)
     if file_extension in ('.exe', '.dll', '.scr', '.bat', '.cmd', '.ps1'):
         analysis_results.append("Executable file detected. HIGHLY SUSPICIOUS!")
     elif file_extension in ('.js', '.vbs', '.hta'):
         analysis_results.append("Script file detected. Potentially suspicious.")
 
-    # NEU: Erweiterte Office-Dokument-Analyse mit oletools
     if file_extension in ('.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx', '.docm', '.xlsm', '.pptm'):
+        vba_parser = None
         try:
-            # VBA_Parser erwartet den Dateipfad als String.
             vba_parser = VBA_Parser(file_path)
-
-            # oletools wirft selbst Exceptions, wenn die Datei kein gültiges OLE/OpenXML ist.
-            # Die 'is_valid_doc'-Prüfung wird entfernt, da sie in manchen oletools-Versionen fehlt.
-
             if vba_parser.detect_vba_macros():
-                analysis_results.append("Office document contains VBA macros. HIGHLY SUSPICIOUS!")
+                analysis_results.append("Macro-enabled Office document detected. HIGHLY SUSPICIOUS!")
 
-                # Optional: Extrahieren und Zusammenfassen der Makro-Informationen
                 auto_exec_macros = []
                 for (filename_in_doc, stream_path, vba_filename, vba_code) in vba_parser.extract_macros():
-                    if vba_code:
-                        if re.search(
-                                r'autoopen|autoclose|workbook_open|document_open|document_close|autoexec|sub auto_open|sub auto_close|sub workbook_open|sub document_open|sub document_close',
-                                vba_code, re.IGNORECASE):
-                            auto_exec_macros.append(vba_filename)
+                    if vba_code and re.search(
+                            r'autoopen|autoclose|workbook_open|document_open|document_close|autoexec',
+                            vba_code, re.IGNORECASE):
+                        auto_exec_macros.append(vba_filename)
 
                 if auto_exec_macros:
-                    analysis_results.append(f"  - Auto-executing macros found in: {', '.join(auto_exec_macros)}")
+                    analysis_results.append(f"Auto-executing macros found in: {', '.join(auto_exec_macros)}")
             else:
                 analysis_results.append("Office document found, no VBA macros detected.")
-
-            vba_parser.close()  # Wichtig: Parser schließen, um Datei-Handles freizugeben
-
         except Exception as e:
-            # Dieser generische Fehler fängt jetzt alle oletools-spezifischen Probleme ab
-            # (z.B. wenn die Datei kein gültiges OLE/OpenXML-Format ist oder andere Parser-Fehler).
             analysis_results.append(f"Could not analyze Office document with oletools: {e}")
-            # traceback.print_exc() # Kann hier für tiefere Fehleranalyse aktiviert werden
+            logger.debug("oletools error for %s: %s", file_path, e)
+        finally:
+            if vba_parser is not None:
+                try:
+                    vba_parser.close()
+                except Exception:
+                    pass
 
     if not analysis_results:
         analysis_results.append("No specific static analysis findings.")
@@ -395,38 +330,106 @@ def analyze_attachment_static(file_path):
     return analysis_results
 
 
+# --- Header-Hilfsfunktion: Domain aus einer Adresse ziehen ---
+
+def _extract_domain(value):
+    if not value:
+        return None
+    m = re.search(r'@([a-zA-Z0-9.-]+)', value)
+    return m.group(1).lower().rstrip('.>') if m else None
+
+
+# --- Risikobewertung (zentral, damit der Score auch im JSON landet) ---
+
+def compute_overall_risk(parsed_data):
+    """
+    Berechnet den konsolidierten Risk Score + Verdict aus allen Befunden.
+    Gibt ein Dict zurück, das in parsed_data gespeichert (und damit exportiert) wird.
+    """
+    alerts = []
+    risk_score = 0
+    headers = parsed_data.get('Headers', {})
+
+    if headers.get('Spoofing_Detected'):
+        reasons = "; ".join(headers.get('Spoofing_Reasons', [])) or "authentication/alignment failure"
+        alerts.append(f"Potential spoofing detected ({reasons}) (High Risk)")
+        risk_score += 3
+
+    blacklist = headers.get('Origin_IP_Blacklist_Status')
+    if blacklist not in ["Clean (No specific blacklist hit in demo / Public IP)", "N/A",
+                         "Private IP (Internal Network, Not Publicly Routable)"]:
+        alerts.append("Origin IP is blacklisted or suspicious (Medium Risk)")
+        risk_score += 2
+
+    subj_kw = headers.get('Suspicious_Subject_Keywords')
+    if subj_kw and subj_kw != "No suspicious keywords found":
+        alerts.append(f"Suspicious keywords in subject: {subj_kw} (Low-Medium Risk)")
+        risk_score += 1
+
+    # Deceptive link findings (Anzeigetext != Ziel-Domain)
+    for finding in parsed_data.get('HTML_Findings', []):
+        alerts.append(f"{finding} (High Risk)")
+        risk_score += 3
+
+    url_total = 0
+    if isinstance(parsed_data.get('URLs'), list):
+        for url_entry in parsed_data['URLs']:
+            if url_entry.get('url_score', 0) > 0:
+                url_total += url_entry['url_score']
+    if url_total > 0:
+        risk_score += (url_total // 2) + 1
+
+    for att_entry in parsed_data.get('Attachments', []):
+        if att_entry.get('error'):
+            alerts.append(f"Error processing attachment '{att_entry.get('filename', 'N/A')}' (Medium Risk)")
+            risk_score += 2
+        for finding in att_entry.get('static_analysis', []):
+            if "Executable file detected" in finding:
+                alerts.append(f"Attachment '{att_entry.get('filename')}' is executable (CRITICAL)")
+                risk_score += 5
+            elif "Auto-executing macros found" in finding:
+                alerts.append(f"Attachment '{att_entry.get('filename')}' has auto-executing macros (EXTREME)")
+                risk_score += 4
+            elif "Macro-enabled Office document detected" in finding:
+                alerts.append(f"Attachment '{att_entry.get('filename')}' is macro-enabled (High Risk)")
+                risk_score += 3
+            elif "Potentially suspicious" in finding or "Script file detected" in finding:
+                alerts.append(f"Attachment '{att_entry.get('filename')}' has suspicious static findings (Medium)")
+                risk_score += 2
+
+    if risk_score == 0:
+        verdict = "No obvious risks found (based on current analysis)."
+    elif risk_score <= 3:
+        verdict = "Low to Medium Risk. Review carefully."
+    elif risk_score <= 7:
+        verdict = "Medium to High Risk. Several suspicious indicators - proceed with caution."
+    else:
+        verdict = "HIGH to CRITICAL Risk. Highly suspicious or malicious - extreme caution."
+
+    return {'score': risk_score, 'verdict': verdict, 'alerts': alerts}
+
+
 # --- Hauptfunktion zum Parsen und Analysieren der E-Mail ---
 
 def parse_email(file_path):
     """
-    Parst eine .eml-Datei, extrahiert Header-Informationen, IPs, URLs und analysiert diese.
-    Erweitert um Dateianhang-Analyse.
-
-    Args:
-        file_path (str): Der Pfad zur .eml-Datei.
-
-    Returns:
-        dict: Ein Wörterbuch mit allen extrahierten und analysierten Informationen oder None bei Fehler.
+    Parst eine .eml-Datei, extrahiert Header/IPs/URLs/Anhänge und analysiert sie.
     """
-    # Sicherstellen, dass msg, email_body und analysis_results immer definiert sind
-    msg = None
     email_body = ""
-    # Initialisiere analysis_results mit allen erwarteten Top-Level-Keys, um Fehler zu vermeiden
-    analysis_results = {
-        'Headers': {},
-        'URLs': [],
-        'Attachments': [],
-        'Body_Content': ""
-    }
-    extracted_urls_from_html = []  # Initialisierung für HTML-URLs
+    extracted_urls_from_html = []
+    html_findings = []
 
     try:
         with open(file_path, 'rb') as f:
             msg = BytesParser(policy=policy.default).parse(f)
 
-        # analysis_results neu initialisieren nach erfolgreichem Parsen der E-Mail
-        analysis_results = {}
-        analysis_results['Attachments'] = []
+        analysis_results = {
+            'Headers': {},
+            'URLs': [],
+            'Attachments': [],
+            'HTML_Findings': [],
+            'Body_Content': ""
+        }
 
         # --- HEADER-ANALYSE ---
         analysis_results['Headers'] = {
@@ -455,491 +458,350 @@ def parse_email(file_path):
                         break
         analysis_results['Headers']['Origin_IP'] = origin_ip
 
-        # Absenderdomain aus From-Header
-        if analysis_results['Headers']['From']:
-            domain_match = re.search(r'@([a-zA-Z0-9.-]+)', analysis_results['Headers']['From'])
-            if domain_match:
-                analysis_results['Headers']['Sender_Domain'] = domain_match.group(1)
-            else:
-                analysis_results['Headers']['Sender_Domain'] = "Not found in From Header"
-        else:
-            analysis_results['Headers']['Sender_Domain'] = "Not available"
+        # Absenderdomain (From) und Return-Path-Domain
+        from_domain = _extract_domain(analysis_results['Headers']['From'])
+        analysis_results['Headers']['Sender_Domain'] = from_domain or "Not available"
 
-        # Extrahiere Return-Path (oft der "Envelope From" oder "Mail From" Absender)
         return_path = msg.get('Return-Path')
-        if return_path:
-            # Versuche, die Domain aus dem Return-Path zu extrahieren
-            return_path_domain_match = re.search(r'@([a-zA-Z0-9.-]+)', return_path)
-            if return_path_domain_match:
-                analysis_results['Headers']['Return_Path_Domain'] = return_path_domain_match.group(1)
-            else:
-                # Manchmal ist der Return-Path nur eine E-Mail-Adresse ohne Domain, oder leer
-                analysis_results['Headers']['Return_Path_Domain'] = return_path  # Speichere den gesamten Return-Path
-        else:
-            analysis_results['Headers']['Return_Path_Domain'] = "Not found"
+        rp_domain = _extract_domain(return_path)
+        analysis_results['Headers']['Return_Path_Domain'] = rp_domain or (return_path or "Not found")
 
-        # SPF, DKIM, DMARC-Ergebnisse
-        auth_results = msg.get('Authentication-Results')
-        if auth_results:
-            analysis_results['Headers']['SPF_Result'] = re.search(r'spf=(\w+)', auth_results).group(1) if re.search(
-                r'spf=(\w+)', auth_results) else "Not found"
-            analysis_results['Headers']['DKIM_Result'] = re.search(r'dkim=(\w+)', auth_results).group(1) if re.search(
-                r'dkim=(\w+)', auth_results) else "Not found"
-            analysis_results['Headers']['DMARC_Result'] = re.search(r'dmarc=(\w+)', auth_results).group(1) if re.search(
-                r'dmarc=(\w+)', auth_results) else "Not found"
-        else:
-            analysis_results['Headers']['SPF_Result'] = "Not available"
-            analysis_results['Headers']['DKIM_Result'] = "Not available"
-            analysis_results['Headers']['DMARC_Result'] = "Not available"
+        # --- AUTHENTICATION-RESULTS (mit Trust-Boundary) ---
+        # WICHTIG: A-R-Header sind nur vertrauenswürdig, wenn sie von der eigenen
+        # empfangenden MTA stammen (authserv-id). Wir nehmen den OBERSTEN A-R-Header
+        # (zuletzt von der empfangenden Infrastruktur vorangestellt).
+        auth_results_all = msg.get_all('Authentication-Results') or []
+        spf_result = dkim_result = dmarc_result = "Not available"
+        authserv_id = ""
+        ar_trusted = False
 
-        # Basis-Spoofing-Check
+        if auth_results_all:
+            auth_results = str(auth_results_all[0])
+            authserv_id = auth_results.split(';', 1)[0].strip().split()[0] if auth_results else ""
+
+            def _grab(field):
+                m = re.search(field + r'=(\w+)', auth_results)
+                return m.group(1) if m else "Not found"
+
+            spf_result = _grab('spf')
+            dkim_result = _grab('dkim')
+            dmarc_result = _grab('dmarc')
+
+            if TRUSTED_AUTHSERV_ID and authserv_id.lower() == TRUSTED_AUTHSERV_ID.lower():
+                ar_trusted = True
+
+        analysis_results['Headers']['Auth_Serv_ID'] = authserv_id or "N/A"
+        analysis_results['Headers']['SPF_Result'] = spf_result
+        analysis_results['Headers']['DKIM_Result'] = dkim_result
+        analysis_results['Headers']['DMARC_Result'] = dmarc_result
+        analysis_results['Headers']['Auth_Results_Trusted'] = ar_trusted
+
+        if ar_trusted:
+            analysis_results['Headers']['Auth_Trust_Note'] = \
+                f"Authentication-Results trusted (authserv-id: {authserv_id})."
+        else:
+            analysis_results['Headers']['Auth_Trust_Note'] = (
+                "Authentication-Results NOT trusted - set TRUSTED_AUTHSERV_ID to your boundary MTA. "
+                "SPF/DKIM/DMARC values below are informational only and excluded from the spoofing verdict."
+            )
+
+        # --- SPOOFING-VERDICT: Domain-Alignment (immer) + Auth (nur wenn vertrauenswürdig) ---
         spoofing_detected = False
-        dmarc_result = analysis_results['Headers'].get('DMARC_Result', 'Not available')
-        spf_result = analysis_results['Headers'].get('SPF_Result', 'Not available')
-        dkim_result = analysis_results['Headers'].get('DKIM_Result', 'Not available')
+        spoofing_reasons = []
 
-        if dmarc_result == "fail":
+        if from_domain and rp_domain and from_domain != rp_domain:
             spoofing_detected = True
-        elif dmarc_result in ["neutral", "none", "temperror", "permerror"] and (
-                spf_result == "fail" or dkim_result == "fail"):
-            spoofing_detected = True
+            spoofing_reasons.append(f"From domain ({from_domain}) != Return-Path domain ({rp_domain})")
+
+        if ar_trusted:
+            if dmarc_result == "fail":
+                spoofing_detected = True
+                spoofing_reasons.append("DMARC=fail")
+            elif dmarc_result in ["neutral", "none", "temperror", "permerror"] and \
+                    (spf_result == "fail" or dkim_result == "fail"):
+                spoofing_detected = True
+                spoofing_reasons.append("SPF or DKIM=fail with weak/absent DMARC")
 
         analysis_results['Headers']['Spoofing_Detected'] = spoofing_detected
+        analysis_results['Headers']['Spoofing_Reasons'] = spoofing_reasons
 
-        # Geo-IP und Blacklist für Origin_IP
-        if analysis_results['Headers'].get('Origin_IP') and analysis_results['Headers'][
-            'Origin_IP'] != "No IP found in Received Header":
-            geo_info = get_geo_ip_info(analysis_results['Headers']['Origin_IP'])
-            if geo_info:
-                analysis_results['Headers']['Origin_IP_Geo_Country'] = geo_info.get('country')
-                analysis_results['Headers']['Origin_IP_Geo_City'] = geo_info.get('city')
-                analysis_results['Headers']['Origin_IP_Geo_ISP'] = geo_info.get('isp')
-            else:
-                analysis_results['Headers']['Origin_IP_Geo_Country'] = "N/A"
-                analysis_results['Headers']['Origin_IP_Geo_City'] = "N/A"
-                analysis_results['Headers']['Origin_IP_Geo_ISP'] = "N/A"
-        else:
-            analysis_results['Headers']['Origin_IP_Geo_Country'] = "N/A"
-            analysis_results['Headers']['Origin_IP_Geo_City'] = "N/A"
-            analysis_results['Headers']['Origin_IP_Geo_ISP'] = "N/A"
+        # Geo-IP und Blacklist
+        geo_info = get_geo_ip_info(origin_ip) if origin_ip != "No IP found in Received Header" else None
+        analysis_results['Headers']['Origin_IP_Geo_Country'] = (geo_info or {}).get('country', "N/A")
+        analysis_results['Headers']['Origin_IP_Geo_City'] = (geo_info or {}).get('city', "N/A")
+        analysis_results['Headers']['Origin_IP_Geo_ISP'] = (geo_info or {}).get('isp', "N/A")
+        analysis_results['Headers']['Origin_IP_Blacklist_Status'] = check_ip_blacklist(origin_ip)
 
-        analysis_results['Headers']['Origin_IP_Blacklist_Status'] = check_ip_blacklist(
-            analysis_results['Headers']['Origin_IP'])
-
-        # Verdächtige Keywords im Betreff suchen
+        # Verdächtige Keywords im Betreff
         suspicious_subject_keywords = [
             "Important", "Account", "Password", "Order", "Invoice", "Win",
             "Urgent", "Security Alert", "Verify", "Update",
             "Suspended", "Payment", "Refund", "Unusual Activity", "Delivery",
             "Shipping", "Expired", "Notification", "Attention"
         ]
-        found_subject_keywords = search_keywords_in_subject(analysis_results['Headers'].get('Subject'),
-                                                            suspicious_subject_keywords)
-        if found_subject_keywords:
-            analysis_results['Headers']['Suspicious_Subject_Keywords'] = ", ".join(found_subject_keywords)
-        else:
-            analysis_results['Headers']['Suspicious_Subject_Keywords'] = "No suspicious keywords found"
+        found_subject_keywords = search_keywords_in_subject(
+            analysis_results['Headers'].get('Subject'), suspicious_subject_keywords)
+        analysis_results['Headers']['Suspicious_Subject_Keywords'] = \
+            ", ".join(found_subject_keywords) if found_subject_keywords else "No suspicious keywords found"
 
-        # --- E-MAIL-BODY-EXTRAKTION & ANHANGS-EXTRAKTION ---
-        # email_body wurde bereits initialisiert zu Beginn der Funktion (falls kein Text-Part gefunden wird)
-        # extracted_urls_from_html wurde bereits initialisiert
-
-        # Gehe alle Teile der E-Mail durch (walk() durchläuft alle Sub-Parts)
-        # msg.walk() ist für die rekursive Durchsuchung am besten geeignet
+        # --- BODY-, URL- UND ANHANGS-EXTRAKTION ---
         for part in msg.walk():
             ctype = part.get_content_type()
             cdispo = str(part.get('Content-Disposition'))
 
-            # 1. Text-Body extrahieren (bevorzugt text/plain)
-            # Nur den ersten text/plain-Teil als Haupt-Body nehmen, wenn nicht als Anhang gekennzeichnet
+            # 1. Text-Body (erster text/plain-Part)
             if ctype == 'text/plain' and 'attachment' not in cdispo:
                 try:
-                    current_part_body = part.get_payload(decode=True).decode('utf-8', errors='ignore')
-                    if not email_body:  # Füge nur hinzu, wenn email_body noch leer ist (d.h. erster Klartext-Part)
-                        email_body = current_part_body
+                    current = part.get_payload(decode=True)
+                    if current and not email_body:
+                        email_body = current.decode('utf-8', errors='ignore')
                 except Exception as e:
-                    print(f"Error decoding text/plain part: {e}")
+                    logger.debug("Error decoding text/plain part: %s", e)
 
-            # NEU: HTML-Body extrahieren und URLs parsen
+            # 2. HTML-Body: URLs + Deceptive-Link-Erkennung
             elif ctype == 'text/html' and 'attachment' not in cdispo:
                 try:
-                    html_body = part.get_payload(decode=True).decode('utf-8', errors='ignore')
+                    payload = part.get_payload(decode=True)
+                    html_body = payload.decode('utf-8', errors='ignore') if payload else ""
                     soup = BeautifulSoup(html_body, 'html.parser')
 
-                    # URLs aus <a> Tags extrahieren
                     for link in soup.find_all('a', href=True):
                         actual_url = link['href']
                         displayed_text = link.get_text().strip()
+                        extracted_urls_from_html.append(actual_url)
 
-                        # Prüfen auf sichtbare Abweichung (Phishing)
-                        if displayed_text and actual_url and actual_url != displayed_text:
-                            # Wenn der sichtbare Text eine URL ähnelt, fügen wir diese auch zur Analyse hinzu
-                            if re.match(r'https?://', displayed_text):
-                                extracted_urls_from_html.append(displayed_text)
-                            # Manchmal sind auch einfach nur die Domains unterschiedlich
+                        # FIX: echte Deceptive-Link-Erkennung
+                        # Wenn der sichtbare Text wie eine URL aussieht und auf eine ANDERE
+                        # Domain zeigt als das tatsächliche href, ist das ein Phishing-Indikator.
+                        if displayed_text and re.match(r'https?://', displayed_text, re.IGNORECASE):
+                            extracted_urls_from_html.append(displayed_text)
                             try:
-                                if urlparse(actual_url).netloc != urlparse(displayed_text).netloc:
-                                    # Optional: print(f"Domain mismatch: Displayed '{urlparse(displayed_text).netloc}' vs Actual '{urlparse(actual_url).netloc}'")
-                                    pass
-                            except ValueError:  # Bei ungültigen URLs in Text oder href
+                                disp_host = (urlparse(displayed_text).hostname or "").lower()
+                                act_host = (urlparse(actual_url).hostname or "").lower()
+                                if disp_host and act_host and disp_host != act_host:
+                                    html_findings.append(
+                                        f"Deceptive link: text shows '{disp_host}' but links to '{act_host}'")
+                            except ValueError:
                                 pass
 
-                        extracted_urls_from_html.append(actual_url)  # Immer die eigentliche URL hinzufügen
-
-                    # URLs aus <img>, <script src>, <link href>, <iframe src> etc.
                     for tag in soup.find_all(['img', 'script', 'iframe', 'link']):
-                        if tag.name == 'img' and tag.has_attr('src'):
+                        if tag.name in ('img', 'script', 'iframe') and tag.has_attr('src'):
                             extracted_urls_from_html.append(tag['src'])
-                        if tag.name == 'script' and tag.has_attr('src'):
-                            extracted_urls_from_html.append(tag['src'])
-                        if tag.name == 'iframe' and tag.has_attr('src'):
-                            extracted_urls_from_html.append(tag['src'])
-                        if tag.name == 'link' and tag.has_attr('href'):
+                        elif tag.name == 'link' and tag.has_attr('href'):
                             extracted_urls_from_html.append(tag['href'])
 
-                    # Auch nach URLs in CSS-Styles suchen (rudimentär)
                     style_urls = re.findall(r'url\([\'"]?(.*?)[\'"]?\)', html_body)
                     extracted_urls_from_html.extend(style_urls)
-
                 except Exception as e:
-                    print(f"Error parsing HTML part or extracting URLs: {e}")
+                    logger.debug("Error parsing HTML part: %s", e)
 
-            # 2. Anhänge extrahieren
-            # Prüfe, ob ein Dateiname existiert oder ob Content-Disposition 'attachment' ist
-            # ignoriere den Root-Part und Text-Teile, die wir schon verarbeitet haben
+            # 3. Anhänge
+            if part.is_multipart():
+                continue
             if part.get_filename() or 'attachment' in cdispo:
-                # Stelle sicher, dass es sich nicht um den Haupt-Container-Part handelt (multipart-root)
-                # und dass es nicht einfach nur ein text/plain oder text/html Teil ist, der keinen Dateinamen hat
-                if part.is_multipart() or (not part.get_filename() and 'attachment' not in cdispo):
-                    continue  # Überspringe Container-Teile und Text-Teile ohne Dateinamen/explizite Anhangs-Disposition
-
-                # Wenn es ein Anhang ist (hat einen Dateinamen oder ist als Anhang deklariert)
                 file_name = part.get_filename()
-                if not file_name and 'attachment' in cdispo:  # Versuche Dateiname aus Content-Disposition zu extrahieren
-                    fname_match = re.search(r'filename\*?=(.+)', cdispo)
+                # get_filename() behandelt RFC 2231 bereits; einfacher Fallback:
+                if not file_name and 'attachment' in cdispo:
+                    fname_match = re.search(r'filename\*?="?([^"]+)"?', cdispo)
                     if fname_match:
                         file_name = fname_match.group(1).strip()
-                        file_name = re.sub(r"[\"']", "", file_name)
-                        try:  # RFC 2231 Dekodierung für spezielle Zeichen
-                            from email.utils import decode_rfc2231
-                            decoded_fn = decode_rfc2231(file_name)
-                            if decoded_fn:
-                                file_name = decoded_fn
-                        except ImportError:
-                            pass
 
-                if file_name:  # Wenn ein gültiger Dateiname gefunden wurde
-                    file_data = part.get_payload(decode=True)  # Inhalt dekodieren
+                if file_name:
+                    file_data = part.get_payload(decode=True)
+                    if file_data is None:
+                        continue
 
-                    # Sicherstellen, dass das Verzeichnis für Anhänge existiert
                     script_dir = os.path.dirname(os.path.abspath(__file__))
                     full_attachment_dir = os.path.join(script_dir, ATTACHMENT_SAVE_DIR)
-                    if not os.path.exists(full_attachment_dir):
-                        os.makedirs(full_attachment_dir)
+                    os.makedirs(full_attachment_dir, exist_ok=True)
 
-                    # Dateinamen sanitizen (nur Basisteil, keine Pfade, um Path Traversal zu verhindern)
+                    # Path-Traversal-Schutz: nur Basisname verwenden
                     sanitized_file_name = os.path.basename(file_name)
                     attachment_path = os.path.join(full_attachment_dir, sanitized_file_name)
 
                     try:
                         with open(attachment_path, 'wb') as att_file:
                             att_file.write(file_data)
-
-                        attachment_info = {
+                        analysis_results['Attachments'].append({
                             'filename': sanitized_file_name,
                             'size': len(file_data),
-                            'path': attachment_path,  # Speichere den vollen Pfad zur Datei
+                            'path': attachment_path,
                             'hashes': calculate_file_hashes(attachment_path),
                             'static_analysis': analyze_attachment_static(attachment_path),
-                            'virustotal_scan_status': "Skipped (API Key not used/Quota limitations)"  # Platzhalter
-                        }
-                        analysis_results['Attachments'].append(attachment_info)
+                            'virustotal_scan_status': "Skipped (API key not used)"
+                        })
                     except Exception as e:
-                        print(f"Error saving attachment {sanitized_file_name}: {e}")
+                        logger.error("Error saving attachment %s: %s", sanitized_file_name, e)
                         analysis_results['Attachments'].append({
                             'filename': sanitized_file_name,
                             'error': str(e),
-                            'virustotal_scan_status': "Skipped (API Key not used/Quota limitations)"
+                            'virustotal_scan_status': "Skipped (API key not used)"
                         })
 
-        analysis_results['Body_Content'] = email_body[:500] + "..." if len(email_body) > 500 else email_body
+        analysis_results['HTML_Findings'] = html_findings
+        analysis_results['Body_Content'] = (email_body[:500] + "...") if len(email_body) > 500 else email_body
 
-        # --- URL-EXTRAKTION & ANALYSE ---
-        # URLs aus Klartextbody und HTML-Body kombinieren und Duplikate entfernen
-        combined_urls = list(
-            set(extract_urls_from_text(email_body) + extracted_urls_from_html))  # NEU: Kombiniere und bereinige
-        analysis_results['URLs'] = []
+        # --- URL-ANALYSE ---
+        combined_urls = sorted(set(extract_urls_from_text(email_body) + extracted_urls_from_html))
+        url_list = []
+        for url in combined_urls:
+            patterns, current_url_score = analyze_url_for_suspicious_patterns(url)
+            url_info = {
+                'url': url,
+                'suspicious_patterns': patterns,
+                'url_score': current_url_score,
+                'whois_info': None,
+                'virustotal_scan_status': "Skipped (API key not used)",
+                'google_safe_browsing_status': check_url_google_safe_browsing(url)
+            }
+            host = urlparse(url).hostname
+            if host:
+                whois_data = get_whois_info(host)
+                url_info['whois_info'] = whois_data if whois_data else "No WHOIS info found or lookups disabled"
+            url_info['heuristic_verdict'] = get_heuristic_url_verdict(url_info)
+            url_list.append(url_info)
+        analysis_results['URLs'] = url_list
 
-        if combined_urls:
-            for url in combined_urls:
-                patterns, current_url_score = analyze_url_for_suspicious_patterns(url)
-
-                url_info = {
-                    'url': url,
-                    'suspicious_patterns': patterns,
-                    'url_score': current_url_score,
-                    'whois_info': None,  # whois_info wird danach befüllt
-                    'virustotal_scan_status': "Skipped (API Key not used/Quota limitations)",  # Placeholder VT
-                    'google_safe_Browse_status': check_url_google_safe_Browse(url)  # NEU: GSB-Status
-                }
-
-                parsed_domain = urlparse(url).netloc
-                if parsed_domain:
-                    domain_without_port = parsed_domain.split(':')[0]
-                    whois_data = get_whois_info(domain_without_port)
-                    if whois_data:
-                        url_info['whois_info'] = whois_data
-                    else:
-                        url_info['whois_info'] = "No WHOIS info found or error"
-
-                url_info['heuristic_verdict'] = get_heuristic_url_verdict(url_info)
-
-                analysis_results['URLs'].append(url_info)
-        else:
-            analysis_results['URLs'] = "No URLs found in email body."
+        # --- KONSOLIDIERTER RISK SCORE (jetzt Teil der Ergebnisse -> auch im JSON) ---
+        analysis_results['Risk_Assessment'] = compute_overall_risk(analysis_results)
 
         return analysis_results
 
     except FileNotFoundError:
-        print(f"Error: The email file '{file_path}' was not found. Please ensure it's in the same directory.")
+        logger.error("The email file '%s' was not found.", file_path)
         return None
     except Exception as e:
-        # Importiere traceback, um den vollen Stacktrace auszugeben
-        print(f"An unexpected error occurred during analysis: {e}")
-        traceback.print_exc()  # Dies gibt den vollständigen Stacktrace aus, sehr hilfreich beim Debuggen
+        logger.error("An unexpected error occurred during analysis: %s", e)
+        traceback.print_exc()
         return None
 
 
-# --- Hauptteil des Skripts zum Ausführen ---
+# --- Ausgabe ---
+
+def print_report(parsed_data, email_file):
+    print("\n" + "=" * 60)
+    print(f"|{'Analysis Results':^58}|")
+    print("=" * 60)
+
+    h = parsed_data['Headers']
+
+    # 1. HEADER
+    print("\n--- Header Information ---")
+    print(f"{'Visual Sender (From):':<40} {h.get('From', 'N/A')}")
+    print(f"{'Truth Sender Domain (Return-Path):':<40} {h.get('Return_Path_Domain', 'N/A')}")
+    print(f"{'Truth Sender (Originating IP):':<40} {h.get('Origin_IP', 'N/A')}")
+    print(f"{'Geo-Location:':<40} {h.get('Origin_IP_Geo_Country', 'N/A')}, {h.get('Origin_IP_Geo_City', 'N/A')}")
+    print(f"{'ISP:':<40} {h.get('Origin_IP_Geo_ISP', 'N/A')}")
+    print(f"{'IP Blacklist Status:':<40} {h.get('Origin_IP_Blacklist_Status', 'N/A')}")
+    print("-" * 60)
+    print(f"{'Recipient (To):':<40} {h.get('To', 'N/A')}")
+    print(f"{'Subject:':<40} {h.get('Subject', 'N/A')}")
+    print(f"{'Message-ID:':<40} {h.get('Message-ID', 'N/A')}")
+    print(f"{'X-Mailer:':<40} {h.get('X-Mailer', 'N/A')}")
+    print("-" * 60)
+    print(f"{'Auth authserv-id:':<40} {h.get('Auth_Serv_ID', 'N/A')}")
+    print(f"  {'SPF:':<37} {h.get('SPF_Result', 'N/A')}")
+    print(f"  {'DKIM:':<37} {h.get('DKIM_Result', 'N/A')}")
+    print(f"  {'DMARC:':<37} {h.get('DMARC_Result', 'N/A')}")
+    print(f"  Trust: {h.get('Auth_Trust_Note', 'N/A')}")
+    print("-" * 60)
+    spoof = h.get('Spoofing_Detected', False)
+    print(f"{'!!! SPOOFING DETECTED !!!':<40} {'YES' if spoof else 'No'}")
+    for reason in h.get('Spoofing_Reasons', []):
+        print(f"    - {reason}")
+    print("-" * 60)
+    print(f"{'Suspicious Subject Keywords:':<40} {h.get('Suspicious_Subject_Keywords', 'N/A')}")
+
+    # 2. DECEPTIVE LINKS
+    if parsed_data.get('HTML_Findings'):
+        print("\n--- HTML / Deceptive Link Findings ---")
+        for finding in parsed_data['HTML_Findings']:
+            print(f"  - {finding}")
+
+    # 3. URLs
+    print("\n--- URL Analysis ---")
+    if isinstance(parsed_data.get('URLs'), list) and parsed_data['URLs']:
+        for i, u in enumerate(parsed_data['URLs']):
+            print(f"\n===== URL {i + 1}: {u['url']} =====")
+            patterns = ', '.join(u['suspicious_patterns']) if u['suspicious_patterns'] else 'None found'
+            print(f"  {'Suspicious Patterns:':<22} {patterns}")
+            print(f"  {'URL Risk Score:':<22} {u['url_score']}")
+            print(f"  {'Heuristic Verdict:':<22} {u.get('heuristic_verdict', 'N/A')}")
+            print(f"  {'Google Safe Browsing:':<22} {u.get('google_safe_browsing_status', 'N/A')}")
+            if isinstance(u.get('whois_info'), dict):
+                print(f"  {'WHOIS Registrar:':<22} {u['whois_info'].get('registrar', 'N/A')}")
+                cd = u['whois_info'].get('creation_date')
+                if isinstance(cd, list):
+                    cd = ", ".join(map(str, cd))
+                print(f"  {'WHOIS Created:':<22} {cd if cd else 'N/A'}")
+    else:
+        print("No URLs found.")
+
+    # 4. ATTACHMENTS
+    print("\n--- Attachment Analysis ---")
+    if parsed_data.get('Attachments'):
+        for i, a in enumerate(parsed_data['Attachments']):
+            print(f"\n===== Attachment {i + 1}: {a.get('filename', 'N/A')} =====")
+            if a.get('error'):
+                print(f"  Error: {a['error']}")
+            else:
+                print(f"  Size: {a.get('size', 'N/A')} bytes")
+                print(f"  SHA256: {a['hashes'].get('sha256', 'N/A')}")
+                for finding in a.get('static_analysis', []):
+                    print(f"  - {finding}")
+    else:
+        print("No attachments found.")
+
+    # 5. SUMMARY
+    ra = parsed_data.get('Risk_Assessment', {})
+    print("\n" + "=" * 60)
+    print(f"|{'Analysis Summary':^58}|")
+    print("=" * 60)
+    for alert in ra.get('alerts', []):
+        print(f"  Risk Alert: {alert}")
+    print(f"\nOverall Risk Score: {ra.get('score', 0)}")
+    print(f"Verdict: {ra.get('verdict', 'N/A')}")
+    print("=" * 60)
+
+
+# --- Hauptteil ---
 
 if __name__ == "__main__":
-    # --- Dateiauswahl beim Start ---
     email_file = ""
     while True:
-        # Fragen Sie den Benutzer nach dem vollständigen Pfad zur E-Mail-Datei
-        # Beispielpfad für Windows: C:\Users\IhrName\PycharmProjects\EmailAnalyzer\beispiel_email.eml
-        # Beispielpfad für macOS/Linux: /Users/IhrName/PycharmProjects/EmailAnalyzer/beispiel_email.eml
-        input_path = input("\nPlease enter the full path to the .eml file to analyze (e.g., C:\\path\\to\\email.eml): ")
-
-        # Entferne eventuelle Anführungszeichen, die von Drag-and-Drop in manchen Terminals hinzugefügt werden
+        input_path = input("\nPlease enter the full path to the .eml file to analyze: ")
         input_path = input_path.strip().strip('"')
-
         if os.path.exists(input_path) and os.path.isfile(input_path):
             email_file = input_path
-            break  # Schleife verlassen, wenn ein gültiger Pfad eingegeben wurde
-        else:
-            print(f"Error: The file '{input_path}' does not exist or is not a valid file. Please try again.")
+            break
+        print(f"Error: '{input_path}' does not exist or is not a valid file. Please try again.")
 
-    # --- Start der Analyse (wie gehabt) ---
     print(f"\n{'=' * 60}")
-    print(f"|{'E-Mail Analyse Start':^58}|")
-    print(f"|{'Analysiere Datei: ' + os.path.basename(email_file):<58}|")  # Zeigt nur den Dateinamen an
-    print(f"{'=' * 60}\n")
+    print(f"|{'E-Mail Analysis Start':^58}|")
+    print(f"|{('Analyzing: ' + os.path.basename(email_file)):<58}|")
+    if not ENABLE_EXTERNAL_LOOKUPS:
+        print(f"|{'External lookups DISABLED (opsec mode)':<58}|")
+    print(f"{'=' * 60}")
 
     parsed_data = parse_email(email_file)
 
     if parsed_data:
-        print("\n" + "=" * 60)
-        print(f"|{'Analyse Ergebnisse':^58}|")
-        print("=" * 60)
+        print_report(parsed_data, email_file)
 
-        # --- 1. HEADER ANALYSE ---
-        print("\n--- Header Information ---")
-        print(f"{'Visual Sender (user sees in mail):':<35} {parsed_data['Headers'].get('From', 'N/A')}")
-        print(f"{'Truth Sender Domain (Return-Path):':<35} {parsed_data['Headers'].get('Return_Path_Domain', 'N/A')}")
-        print(f"{'Truth Sender (Actual Originating IP):':<35} {parsed_data['Headers'].get('Origin_IP', 'N/A')}")
-        print(
-            f"{'Truth Sender Geo-Location:':<35} {parsed_data['Headers'].get('Origin_IP_Geo_Country', 'N/A')}, {parsed_data['Headers'].get('Origin_IP_Geo_City', 'N/A')}")
-        print(f"{'Truth Sender ISP:':<35} {parsed_data['Headers'].get('Origin_IP_Geo_ISP', 'N/A')}")
-        print(
-            f"{'Truth Sender IP Blacklist Status:':<35} {parsed_data['Headers'].get('Origin_IP_Blacklist_Status', 'N/A')}")
-        print("-" * 60)
-        print(f"{'Recipient (To):':<35} {parsed_data['Headers'].get('To', 'N/A')}")
-        print(f"{'Subject:':<35} {parsed_data['Headers'].get('Subject', 'N/A')}")
-        print(f"{'Message-ID:':<35} {parsed_data['Headers'].get('Message-ID', 'N/A')}")
-        print(f"{'X-Mailer:':<35} {parsed_data['Headers'].get('X-Mailer', 'N/A')}")
-        print("-" * 60)
-        print(
-            f"{'Authentication Results (for From Header Domain):':<35} {parsed_data['Headers'].get('Sender_Domain', 'N/A')}")
-        print(f"  {'SPF Result:':<32} {parsed_data['Headers'].get('SPF_Result', 'N/A')}")
-        print(f"  {'DKIM Result:':<32} {parsed_data['Headers'].get('DKIM_Result', 'N/A')}")
-        print(f"  {'DMARC Result:':<32} {parsed_data['Headers'].get('DMARC_Result', 'N/A')}")
-        print("-" * 60)
-        spoofing_status = parsed_data['Headers'].get('Spoofing_Detected', False)
-        spoofing_message = "YES - LIKELY SPOOFED! (Authentication Failed)" if spoofing_status else "No (Authentication Passed or Policy Missing)"
-        print(f"{'!!! SPOOFING DETECTED !!!':<35} {spoofing_message}")
-        print("-" * 60)
-        print(
-            f"{'Suspicious Subject Keywords:':<35} {parsed_data['Headers'].get('Suspicious_Subject_Keywords', 'N/A')}")
-
-        # --- 2. URL ANALYSE ---
-        print("\n--- URL Analysis ---")
-        if isinstance(parsed_data.get('URLs'), list) and parsed_data['URLs']:
-            for i, url_entry in enumerate(parsed_data['URLs']):
-                print(f"\n{'=' * 5} URL {i + 1}: {url_entry['url']} {'=' * 5}")
-                susp_patterns_str = ', '.join(url_entry['suspicious_patterns']) if url_entry[
-                    'suspicious_patterns'] else 'None found'
-                print(f"{'  Suspicious Patterns:':<25} {susp_patterns_str}")
-                print(f"{'  URL Risk Score:':<25} {url_entry['url_score']}")
-                print(f"{'  Heuristic Verdict:':<25} {url_entry.get('heuristic_verdict', 'N/A')}")
-                print(f"{'  VirusTotal Status:':<25} {url_entry['virustotal_scan_status']}")
-                print(f"{'  Google Safe Browse:':<25} {url_entry.get('google_safe_Browse_status', 'N/A')}")
-
-                if url_entry['whois_info'] and isinstance(url_entry['whois_info'], dict):
-                    print("  WHOIS Information:")
-                    print(f"    {'Domain Name:':<15} {url_entry['whois_info'].get('domain_name', 'N/A')}")
-                    print(f"    {'Registrar:':<15} {url_entry['whois_info'].get('registrar', 'N/A')}")
-
-                    creation_date = url_entry['whois_info'].get('creation_date')
-                    if isinstance(creation_date, list):
-                        creation_date = ", ".join(map(str, creation_date))
-                    print(f"    {'Created:':<15} {creation_date if creation_date else 'N/A'}")
-
-                    expiration_date = url_entry['whois_info'].get('expiration_date')
-                    if isinstance(expiration_date, list):
-                        expiration_date = ", ".join(map(str, expiration_date))
-                    print(f"    {'Expires:':<15} {expiration_date if expiration_date else 'N/A'}")
-
-                    emails = url_entry['whois_info'].get('emails')
-                    if isinstance(emails, list):
-                        emails = ", ".join(map(str, emails))
-                    print(f"    {'Emails:':<15} {emails if emails else 'N/A'}")
-                else:
-                    print("  WHOIS Information: Not available or error")
-                print("=" * 60)
-
-        else:
-            print(parsed_data.get('URLs', 'No URLs found.'))
-
-        # --- 3. ATTACHMENT ANALYSIS ---
-        print("\n--- Attachment Analysis ---")
-        if parsed_data.get('Attachments'):
-            # Sicherstellen, dass das Verzeichnis für Anhänge existiert
-            if not os.path.exists(ATTACHMENT_SAVE_DIR):
-                os.makedirs(ATTACHMENT_SAVE_DIR)
-            print(f"Attachments saved to: .\\{ATTACHMENT_SAVE_DIR}\\")  # Zeigt den relativen Pfad an
-
-            for i, att_entry in enumerate(parsed_data['Attachments']):
-                print(f"\n{'=' * 5} Attachment {i + 1}: {att_entry.get('filename', 'N/A')} {'=' * 5}")
-                if att_entry.get('error'):
-                    print(f"  Error processing attachment: {att_entry['error']}")
-                else:
-                    print(f"  Path: {att_entry.get('path', 'N/A')}")
-                    print(f"  Size: {att_entry.get('size', 'N/A')} bytes")
-                    print("  Hashes:")
-                    print(f"    MD5: {att_entry['hashes'].get('md5', 'N/A')}")
-                    print(f"    SHA1: {att_entry['hashes'].get('sha1', 'N/A')}")
-                    print(f"    SHA256: {att_entry['hashes'].get('sha256', 'N/A')}")
-                    print("  Static Analysis Findings:")
-                    for finding in att_entry.get('static_analysis', []):
-                        print(f"    - {finding}")
-                    print(f"  VirusTotal Scan Status: {att_entry.get('virustotal_scan_status', 'N/A')}")
-                print("=" * 60)
-        else:
-            print("No attachments found.")
-
-        # --- 4. SUMMARY ---
-        print("\n" + "=" * 60)
-        print(f"|{'Analysis Summary':^58}|")
-        print("=" * 60)
-
-        risk_score = 0
-        if parsed_data['Headers'].get('Spoofing_Detected'):
-            print("Risk Alert: Potential email spoofing detected based on authentication results! (High Risk)")
-            risk_score += 3
-
-        if parsed_data['Headers'].get('Origin_IP_Blacklist_Status') not in [
-            "Clean (No specific blacklist hit in demo / Public IP)", "N/A",
-            "Private IP (Internal Network, Not Publicly Routable)"]:
-            print("Risk Alert: Origin IP is blacklisted or suspicious! (Medium Risk)")
-            risk_score += 2
-
-        if parsed_data['Headers'].get('Suspicious_Subject_Keywords') != "No suspicious keywords found":
-            print(
-                f"Risk Alert: Suspicious keywords found in subject: {parsed_data['Headers']['Suspicious_Subject_Keywords']} (Low-Medium Risk)")
-            risk_score += 1
-
-        url_total_risk_score = 0
-        if isinstance(parsed_data.get('URLs'), list) and parsed_data['URLs']:
-            for url_entry in parsed_data['URLs']:
-                if url_entry['url_score'] > 0:
-                    print(
-                        f"Risk Alert: URL '{url_entry['url']}' has a risk score of {url_entry['url_score']} (Patterns: {', '.join(url_entry['suspicious_patterns']) if url_entry['suspicious_patterns'] else 'None found'})")
-                    url_total_risk_score += url_entry['url_score']
-
-        if url_total_risk_score > 0:
-            risk_score += (url_total_risk_score // 2) + 1
-
-        if parsed_data.get('Attachments'):
-            for att_entry in parsed_data['Attachments']:
-                if att_entry.get('error'):
-                    print(
-                        f"Risk Alert: Error processing attachment '{att_entry.get('filename', 'N/A')}': {att_entry['error']} (Medium Risk)")
-                    risk_score += 2
-                # Hier wird der RISK_SCORE FÜR ANHÄNGE KORRIGIERT
-                # Wir suchen in den Static Analysis Findings nach spezifischen Meldungen
-                for finding in att_entry.get('static_analysis', []):
-                    if "Executable file detected" in finding:
-                        print(
-                            f"Risk Alert: Attachment '{att_entry.get('filename', 'N/A')}' is an executable file! (CRITICAL RISK)")
-                        risk_score += 5  # Sehr hohe Gewichtung
-                    elif "Macro-enabled Office document detected" in finding:
-                        print(
-                            f"Risk Alert: Attachment '{att_entry.get('filename', 'N/A')}' is a macro-enabled Office document! (High Risk)")
-                        risk_score += 3
-                    elif "Auto-executing macros found" in finding:  # Spezifische Meldung für Auto-Macros
-                        print(
-                            f"Risk Alert: Attachment '{att_entry.get('filename', 'N/A')}' contains auto-executing macros! (EXTREME RISK)")
-                        risk_score += 4  # Etwas höher als nur Makros
-                    elif "Potentially suspicious" in finding:  # Andere verdächtige Skripte etc.
-                        print(
-                            f"Risk Alert: Attachment '{att_entry.get('filename', 'N/A')}' has potentially suspicious static findings. (Medium Risk)")
-                        risk_score += 2
-
-        print("\nOverall Risk Assessment:")
-        if risk_score == 0:
-            print("  --> No obvious risks found in this email. (Based on current analysis)")
-        elif risk_score <= 3:
-            print("  --> Low to Medium Risk. Some potential indicators found. Please review carefully.")
-        elif risk_score <= 7:
-            print("  --> Medium to High Risk. Several suspicious indicators found. Proceed with caution!")
-        else:
-            print(
-                "  --> HIGH to CRITICAL Risk! This email is highly suspicious or malicious. Exercise extreme caution!")
-
-        print("\n" + "=" * 60)
-        print(f"|{'Analysis Complete':^58}|")
-        print("=" * 60 + "\n")
-
-        # --- 5. OPTIONAL: EXPORT RESULTS TO JSON ---
-        print("\n" + "=" * 60)
-        print(f"|{'Export Results':^58}|")
-        print("=" * 60)
-
-        export_choice = input("Do you want to export the analysis results to a JSON file? (y/n): ").lower().strip()
+        export_choice = input("\nExport the analysis results to a JSON file? (y/n): ").lower().strip()
         if export_choice == 'y':
-            default_filename_base = os.path.basename(email_file).replace('.eml', '')
-            # Sanitize filename for output to prevent invalid characters if the .eml name is weird
-            sanitized_default_filename_base = re.sub(r'[^\w\-_\.]', '_', default_filename_base)
-
-            output_json_filename = input(
-                f"Enter filename for JSON export (e.g., '{sanitized_default_filename_base}_analysis.json'): ")
-            if not output_json_filename:  # Wenn Benutzer nichts eingibt, Standardnamen verwenden
-                output_json_filename = f"{sanitized_default_filename_base}_analysis.json"
-
-            # Sicherstellen, dass die Dateiendung .json ist
+            base = re.sub(r'[^\w\-_.]', '_', os.path.basename(email_file).replace('.eml', ''))
+            output_json_filename = input(f"Filename (default '{base}_analysis.json'): ").strip()
+            if not output_json_filename:
+                output_json_filename = f"{base}_analysis.json"
             if not output_json_filename.lower().endswith('.json'):
                 output_json_filename += '.json'
-
             export_results_to_json(parsed_data, output_json_filename)
         else:
-            print("Results not exported to file.")
+            print("Results not exported.")
 
-        # --- 6. EMAIL BODY (OPTIONAL, AM ENDE) ---
-        print("\n--- Email Body (Excerpt, max. 500 chars) (For reference only) ---")
+        print("\n--- Email Body (Excerpt, max. 500 chars) ---")
         print(parsed_data.get('Body_Content', 'No body content found.'))
         print("-" * 60)
-
-
     else:
         print("Email analysis could not be performed successfully.")
