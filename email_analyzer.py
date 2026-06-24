@@ -3,62 +3,43 @@ from email import policy
 from email.parser import BytesParser
 import re
 import requests
-import whois  # Benötigt: pip install python-whois
-from urllib.parse import urlparse  # Hilft beim Zerlegen von URLs
-import hashlib  # Für Hash-Berechnungen
-import os  # Für Dateisystemoperationen (Anhänge speichern)
-from datetime import datetime, timedelta, timezone  # Für heuristische URL-Analyse (Domain-Alter)
-import dateutil.parser  # Benötigt: pip install python-dateutil - für robustes Datums-Parsing
-import traceback  # Für detaillierte Fehlermeldungen
-import logging  # Statt stiller except:pass -> gezieltes Logging
+import whois  # pip install python-whois
+from urllib.parse import urlparse
+import hashlib
+import os
+from datetime import datetime, timedelta, timezone
+import dateutil.parser  # pip install python-dateutil
+import traceback
+import logging
 
-# Oletools für erweiterte Anhangsanalyse
-# Benötigt: pip install oletools
-import oletools.olevba
-from oletools.olevba import VBA_Parser  # Für VBA-Makro-Analyse
-
-# BeautifulSoup für HTML-Parsing
-# Benötigt: pip install beautifulsoup4
-from bs4 import BeautifulSoup
-
-# JSON für den Export der Ergebnisse
+from oletools.olevba import VBA_Parser  # pip install oletools - macro analysis
+from bs4 import BeautifulSoup  # pip install beautifulsoup4
 import json
 
-# --- Logging ---
 logging.basicConfig(level=logging.WARNING, format="%(levelname)s: %(message)s")
 logger = logging.getLogger("email_analyzer")
 
-# --- Konfiguration ---
-# Pfad, unter dem Anhänge gespeichert werden sollen (relativ zum Skript)
+# --- Config ---
+
 ATTACHMENT_SAVE_DIR = "attachments_extracted"
 
-# Opsec: Externe Lookups (Geo-IP, WHOIS) senden Indikatoren an Dritte.
-# Über Umgebungsvariable steuerbar; Default = aktiviert.
-#   EMAILANALYZER_EXTERNAL_LOOKUPS=0  -> deaktiviert (keine Daten an Dritte)
+# external lookups (geo-ip, whois) leak IOCs to third parties - opt-out via env
 ENABLE_EXTERNAL_LOOKUPS = os.environ.get("EMAILANALYZER_EXTERNAL_LOOKUPS", "1") != "0"
 
-# Vertrauensgrenze für Authentication-Results (RFC 8601):
-# Nur der A-R-Header der EIGENEN, empfangenden MTA ist vertrauenswürdig - ein Angreifer
-# kann in der rohen Mail beliebige A-R-Header faelschen. Trage hier die authserv-id eurer
-# empfangenden MTA ein (z. B. "mx.example.com"). Bleibt das leer, werden A-R-Header als
-# NICHT vertrauenswürdig behandelt und fliessen nicht in den Spoofing-Verdict ein.
+# only the A-R header from our own receiving MTA is trustworthy; attacker can forge
+# the rest. set this to your boundary MTA's authserv-id, else A-R is ignored for the verdict.
 TRUSTED_AUTHSERV_ID = os.environ.get("EMAILANALYZER_TRUSTED_AUTHSERV_ID", "")
 
 
-# --- Hilfsfunktionen für IP- und Keyword-Analyse ---
+# --- IP / keyword helpers ---
 
 def get_geo_ip_info(ip_address):
-    """
-    Ruft Geo-IP-Informationen für eine gegebene IP-Adresse ab (ip-api.com).
-    Wird nur ausgeführt, wenn externe Lookups erlaubt sind (Opsec).
-    """
     if not ENABLE_EXTERNAL_LOOKUPS:
         return None
     if not ip_address or ip_address == "No IP found in Received Header":
         return None
 
-    # Hinweis: Der kostenlose ip-api.com-Endpunkt ist nur über HTTP verfügbar
-    # (kein TLS). Für produktive Nutzung lokale GeoLite2-DB oder bezahlte HTTPS-API.
+    # free ip-api endpoint is http-only; use GeoLite2 or a paid HTTPS API in prod
     url = f"http://ip-api.com/json/{ip_address}"
     try:
         response = requests.get(url, timeout=5)
@@ -80,14 +61,12 @@ def get_geo_ip_info(ip_address):
 
 
 def check_ip_blacklist(ip_address):
-    """
-    Vereinfachter Blacklist-Check (Platzhalter für eine echte RBL/Threat-Intel-Anbindung).
-    """
+    # stub - swap for a real RBL / threat-intel lookup
     if not ip_address or ip_address == "No IP found in Received Header":
         return "N/A"
 
     if ip_address == "192.0.2.1":
-        return "Known Test IP (Highly Suspicious)"  # reservierte Test-IP (RFC 5737)
+        return "Known Test IP (Highly Suspicious)"
     elif ip_address.startswith("192.168.") or ip_address.startswith("10.") or ip_address.startswith("172.16."):
         return "Private IP (Internal Network, Not Publicly Routable)"
     elif ip_address.startswith("1.2.3."):
@@ -97,10 +76,7 @@ def check_ip_blacklist(ip_address):
 
 
 def search_keywords_in_subject(subject, keywords):
-    """
-    Sucht nach verdächtigen Keywords im Betreff - mit Wortgrenzen, um
-    Substring-Fehltreffer zu vermeiden (z. B. "Win" in "showing").
-    """
+    # word boundaries so "Win" doesn't match inside "showing"
     if not subject:
         return []
 
@@ -112,28 +88,22 @@ def search_keywords_in_subject(subject, keywords):
     return found_keywords
 
 
-# --- Funktionen für URL-Analyse ---
+# --- URL analysis ---
 
 def extract_urls_from_text(text):
-    """
-    Extrahiert URLs aus einem Text. Bewusst einfacher, robuster Regex
-    (greift alles ab dem Schema bis zum nächsten Whitespace/Trennzeichen).
-    """
     if not text:
         return []
+    # grab everything from the scheme up to the next whitespace/closing char
     url_pattern = re.compile(
-        r'(?:https?|ftp|file)://'      # Schema
-        r'[^\s<>"\')\]]+',             # bis zum nächsten Whitespace / schliessenden Zeichen
+        r'(?:https?|ftp|file)://'
+        r'[^\s<>"\')\]]+',
         re.IGNORECASE
     )
-    # Häufige nachlaufende Satzzeichen abschneiden
+    # strip trailing punctuation that gets caught
     return [u.rstrip('.,);\'"') for u in url_pattern.findall(text)]
 
 
 def get_whois_info(domain):
-    """
-    Ruft WHOIS-Informationen ab. Nur bei erlaubten externen Lookups (Opsec).
-    """
     if not ENABLE_EXTERNAL_LOOKUPS:
         return None
     try:
@@ -154,30 +124,26 @@ def get_whois_info(domain):
 
 
 def analyze_url_for_suspicious_patterns(url):
-    """
-    Analysiert eine URL auf verdächtige Muster und weist einen Risikowert zu.
-    """
     suspicious_patterns = []
     url_score = 0
 
     parsed_url = urlparse(url)
-    # hostname() entfernt Port und Userinfo -> robuster als netloc
-    host = parsed_url.hostname or ""
+    host = parsed_url.hostname or ""  # hostname strips port/userinfo, unlike netloc
     path = parsed_url.path or ""
     query = parsed_url.query or ""
 
-    # 1. IP-Adresse als Domain (IPv4 oder IPv6-Literal)
+    # raw IP instead of a domain (v4 or v6 literal)
     if re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$', host) or \
             re.match(r'^[0-9a-fA-F:]+$', host) and ':' in host:
         suspicious_patterns.append("IP as domain")
         url_score += 3
 
-    # 2. Sehr langer Query-Parameter (mögliche Verschleierung)
+    # very long query string - common obfuscation
     if len(query) > 100:
         suspicious_patterns.append(f"Long query ({len(query)} chars)")
         url_score += 2
 
-    # 3. Verdächtige Keywords in Pfad/Query
+    # brand / action keywords in path or query
     suspicious_url_keywords = ["login", "update", "verify", "admin", "account", "security", "alert",
                                "bank", "paypal", "invoice", "payment", "support", "amazon", "apple",
                                "microsoft", "icloud", "dropbox", "onedrive"]
@@ -191,9 +157,7 @@ def analyze_url_for_suspicious_patterns(url):
 
 
 def get_heuristic_url_verdict(url_entry):
-    """
-    Heuristische Einschätzung des URL-Risikos (Score + WHOIS), ohne externe Reputations-APIs.
-    """
+    # verdict from score + whois domain age, no external reputation APIs
     score = url_entry.get('url_score', 0)
     whois_info = url_entry.get('whois_info')
 
@@ -213,7 +177,7 @@ def get_heuristic_url_verdict(url_entry):
         if creation_date:
             try:
                 parsed_creation_date = dateutil.parser.parse(str(creation_date))
-                # FIX: naive/aware-Mischfehler vermeiden -> beides auf tz-aware UTC normalisieren
+                # normalize both sides to tz-aware UTC, else naive/aware subtraction throws
                 if parsed_creation_date.tzinfo is None:
                     parsed_creation_date = parsed_creation_date.replace(tzinfo=timezone.utc)
                 now = datetime.now(timezone.utc)
@@ -229,21 +193,16 @@ def get_heuristic_url_verdict(url_entry):
 
 
 def check_url_google_safe_browsing(url, api_key=None):
-    """
-    Platzhalter für die Google Safe Browsing API (kein API-Key in der öffentlichen Version).
-    """
+    # stub - GSB threatMatches:find would go here if a key is configured
     if api_key:
-        # Hier würde die tatsächliche API-Anfrage stehen (threatMatches:find).
         return "SKIPPED (Google Safe Browsing - API key available but not implemented)"
     else:
         return "SKIPPED (Google Safe Browsing - API key not provided)"
 
 
 def export_results_to_json(data, output_filename):
-    """
-    Exportiert die Analysedaten als JSON. datetime-Objekte werden in ISO-Strings konvertiert.
-    """
     try:
+        # datetime isn't JSON-serializable - walk the structure and convert to ISO strings
         def convert_datetime_to_str(obj):
             if isinstance(obj, datetime):
                 return obj.isoformat()
@@ -263,12 +222,9 @@ def export_results_to_json(data, output_filename):
         traceback.print_exc()
 
 
-# --- Funktionen für Dateianhang-Analyse ---
+# --- Attachment analysis ---
 
 def calculate_file_hashes(file_path):
-    """
-    Berechnet MD5, SHA1 und SHA256 einer Datei.
-    """
     hashes = {'md5': '', 'sha1': '', 'sha256': ''}
     try:
         with open(file_path, 'rb') as f:
@@ -284,9 +240,7 @@ def calculate_file_hashes(file_path):
 
 
 def analyze_attachment_static(file_path):
-    """
-    Einfache statische Analyse eines Anhangs, inkl. Makro-Analyse für Office-Dokumente (oletools).
-    """
+    # extension triage + VBA macro check for Office docs
     analysis_results = []
     file_name = os.path.basename(file_path)
     file_extension = os.path.splitext(file_name)[1].lower()
@@ -303,6 +257,7 @@ def analyze_attachment_static(file_path):
             if vba_parser.detect_vba_macros():
                 analysis_results.append("Macro-enabled Office document detected. HIGHLY SUSPICIOUS!")
 
+                # auto-exec keywords = runs on open/close without user action
                 auto_exec_macros = []
                 for (filename_in_doc, stream_path, vba_filename, vba_code) in vba_parser.extract_macros():
                     if vba_code and re.search(
@@ -330,7 +285,7 @@ def analyze_attachment_static(file_path):
     return analysis_results
 
 
-# --- Header-Hilfsfunktion: Domain aus einer Adresse ziehen ---
+# --- Header helper ---
 
 def _extract_domain(value):
     if not value:
@@ -339,13 +294,9 @@ def _extract_domain(value):
     return m.group(1).lower().rstrip('.>') if m else None
 
 
-# --- Risikobewertung (zentral, damit der Score auch im JSON landet) ---
+# --- Risk scoring (central, so the score also ends up in the JSON export) ---
 
 def compute_overall_risk(parsed_data):
-    """
-    Berechnet den konsolidierten Risk Score + Verdict aus allen Befunden.
-    Gibt ein Dict zurück, das in parsed_data gespeichert (und damit exportiert) wird.
-    """
     alerts = []
     risk_score = 0
     headers = parsed_data.get('Headers', {})
@@ -366,11 +317,12 @@ def compute_overall_risk(parsed_data):
         alerts.append(f"Suspicious keywords in subject: {subj_kw} (Low-Medium Risk)")
         risk_score += 1
 
-    # Deceptive link findings (Anzeigetext != Ziel-Domain)
+    # deceptive link = displayed domain != actual href domain
     for finding in parsed_data.get('HTML_Findings', []):
         alerts.append(f"{finding} (High Risk)")
         risk_score += 3
 
+    # dampen URL contribution: lots of low-score URLs shouldn't dominate the total
     url_total = 0
     if isinstance(parsed_data.get('URLs'), list):
         for url_entry in parsed_data['URLs']:
@@ -379,6 +331,7 @@ def compute_overall_risk(parsed_data):
     if url_total > 0:
         risk_score += (url_total // 2) + 1
 
+    # attachments are weighted highest - executables and auto-macros are the worst case
     for att_entry in parsed_data.get('Attachments', []):
         if att_entry.get('error'):
             alerts.append(f"Error processing attachment '{att_entry.get('filename', 'N/A')}' (Medium Risk)")
@@ -409,12 +362,9 @@ def compute_overall_risk(parsed_data):
     return {'score': risk_score, 'verdict': verdict, 'alerts': alerts}
 
 
-# --- Hauptfunktion zum Parsen und Analysieren der E-Mail ---
+# --- Main parse + analyze ---
 
 def parse_email(file_path):
-    """
-    Parst eine .eml-Datei, extrahiert Header/IPs/URLs/Anhänge und analysiert sie.
-    """
     email_body = ""
     extracted_urls_from_html = []
     html_findings = []
@@ -431,7 +381,7 @@ def parse_email(file_path):
             'Body_Content': ""
         }
 
-        # --- HEADER-ANALYSE ---
+        # --- Headers ---
         analysis_results['Headers'] = {
             'From': msg.get('From'),
             'To': msg.get('To'),
@@ -440,7 +390,7 @@ def parse_email(file_path):
             'X-Mailer': msg.get('X-Mailer')
         }
 
-        # Ursprungs-IP aus Received-Headern
+        # origin IP: walk Received headers bottom-up (oldest hop = closest to sender)
         received_headers = msg.get_all('Received')
         origin_ip = "No IP found in Received Header"
         if received_headers:
@@ -449,6 +399,7 @@ def parse_email(file_path):
                 if ip_match:
                     origin_ip = ip_match.group(1)
                     break
+            # fallback: IP right after from/by when not in brackets
             if origin_ip == "No IP found in Received Header":
                 for received_header in reversed(received_headers):
                     ip_match_direct = re.search(r'(?:from|by)\s+\[?(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})',
@@ -458,7 +409,7 @@ def parse_email(file_path):
                         break
         analysis_results['Headers']['Origin_IP'] = origin_ip
 
-        # Absenderdomain (From) und Return-Path-Domain
+        # From domain vs Return-Path domain (alignment check feeds the spoofing verdict)
         from_domain = _extract_domain(analysis_results['Headers']['From'])
         analysis_results['Headers']['Sender_Domain'] = from_domain or "Not available"
 
@@ -466,10 +417,8 @@ def parse_email(file_path):
         rp_domain = _extract_domain(return_path)
         analysis_results['Headers']['Return_Path_Domain'] = rp_domain or (return_path or "Not found")
 
-        # --- AUTHENTICATION-RESULTS (mit Trust-Boundary) ---
-        # WICHTIG: A-R-Header sind nur vertrauenswürdig, wenn sie von der eigenen
-        # empfangenden MTA stammen (authserv-id). Wir nehmen den OBERSTEN A-R-Header
-        # (zuletzt von der empfangenden Infrastruktur vorangestellt).
+        # --- Authentication-Results (with trust boundary) ---
+        # take the topmost A-R header (last one prepended = added by our receiving infra)
         auth_results_all = msg.get_all('Authentication-Results') or []
         spf_result = dkim_result = dmarc_result = "Not available"
         authserv_id = ""
@@ -487,6 +436,7 @@ def parse_email(file_path):
             dkim_result = _grab('dkim')
             dmarc_result = _grab('dmarc')
 
+            # only trust A-R if it came from our configured boundary MTA
             if TRUSTED_AUTHSERV_ID and authserv_id.lower() == TRUSTED_AUTHSERV_ID.lower():
                 ar_trusted = True
 
@@ -505,7 +455,8 @@ def parse_email(file_path):
                 "SPF/DKIM/DMARC values below are informational only and excluded from the spoofing verdict."
             )
 
-        # --- SPOOFING-VERDICT: Domain-Alignment (immer) + Auth (nur wenn vertrauenswürdig) ---
+        # --- Spoofing verdict ---
+        # domain alignment is always checked; auth results only count when trusted
         spoofing_detected = False
         spoofing_reasons = []
 
@@ -525,14 +476,13 @@ def parse_email(file_path):
         analysis_results['Headers']['Spoofing_Detected'] = spoofing_detected
         analysis_results['Headers']['Spoofing_Reasons'] = spoofing_reasons
 
-        # Geo-IP und Blacklist
+        # geo + blacklist on the origin IP
         geo_info = get_geo_ip_info(origin_ip) if origin_ip != "No IP found in Received Header" else None
         analysis_results['Headers']['Origin_IP_Geo_Country'] = (geo_info or {}).get('country', "N/A")
         analysis_results['Headers']['Origin_IP_Geo_City'] = (geo_info or {}).get('city', "N/A")
         analysis_results['Headers']['Origin_IP_Geo_ISP'] = (geo_info or {}).get('isp', "N/A")
         analysis_results['Headers']['Origin_IP_Blacklist_Status'] = check_ip_blacklist(origin_ip)
 
-        # Verdächtige Keywords im Betreff
         suspicious_subject_keywords = [
             "Important", "Account", "Password", "Order", "Invoice", "Win",
             "Urgent", "Security Alert", "Verify", "Update",
@@ -544,12 +494,12 @@ def parse_email(file_path):
         analysis_results['Headers']['Suspicious_Subject_Keywords'] = \
             ", ".join(found_subject_keywords) if found_subject_keywords else "No suspicious keywords found"
 
-        # --- BODY-, URL- UND ANHANGS-EXTRAKTION ---
+        # --- Walk MIME parts: body, URLs, attachments ---
         for part in msg.walk():
             ctype = part.get_content_type()
             cdispo = str(part.get('Content-Disposition'))
 
-            # 1. Text-Body (erster text/plain-Part)
+            # plain-text body (first one only)
             if ctype == 'text/plain' and 'attachment' not in cdispo:
                 try:
                     current = part.get_payload(decode=True)
@@ -558,7 +508,7 @@ def parse_email(file_path):
                 except Exception as e:
                     logger.debug("Error decoding text/plain part: %s", e)
 
-            # 2. HTML-Body: URLs + Deceptive-Link-Erkennung
+            # html body: pull URLs + check for deceptive links
             elif ctype == 'text/html' and 'attachment' not in cdispo:
                 try:
                     payload = part.get_payload(decode=True)
@@ -570,9 +520,8 @@ def parse_email(file_path):
                         displayed_text = link.get_text().strip()
                         extracted_urls_from_html.append(actual_url)
 
-                        # FIX: echte Deceptive-Link-Erkennung
-                        # Wenn der sichtbare Text wie eine URL aussieht und auf eine ANDERE
-                        # Domain zeigt als das tatsächliche href, ist das ein Phishing-Indikator.
+                        # if the visible text looks like a URL but points to a different
+                        # host than the href, that's a classic phishing tell
                         if displayed_text and re.match(r'https?://', displayed_text, re.IGNORECASE):
                             extracted_urls_from_html.append(displayed_text)
                             try:
@@ -584,6 +533,7 @@ def parse_email(file_path):
                             except ValueError:
                                 pass
 
+                    # also collect URLs from src/href of other tags + css url()
                     for tag in soup.find_all(['img', 'script', 'iframe', 'link']):
                         if tag.name in ('img', 'script', 'iframe') and tag.has_attr('src'):
                             extracted_urls_from_html.append(tag['src'])
@@ -595,12 +545,12 @@ def parse_email(file_path):
                 except Exception as e:
                     logger.debug("Error parsing HTML part: %s", e)
 
-            # 3. Anhänge
+            # attachments
             if part.is_multipart():
                 continue
             if part.get_filename() or 'attachment' in cdispo:
                 file_name = part.get_filename()
-                # get_filename() behandelt RFC 2231 bereits; einfacher Fallback:
+                # fallback if get_filename() returns nothing
                 if not file_name and 'attachment' in cdispo:
                     fname_match = re.search(r'filename\*?="?([^"]+)"?', cdispo)
                     if fname_match:
@@ -615,7 +565,7 @@ def parse_email(file_path):
                     full_attachment_dir = os.path.join(script_dir, ATTACHMENT_SAVE_DIR)
                     os.makedirs(full_attachment_dir, exist_ok=True)
 
-                    # Path-Traversal-Schutz: nur Basisname verwenden
+                    # basename only - blocks path traversal via crafted filenames
                     sanitized_file_name = os.path.basename(file_name)
                     attachment_path = os.path.join(full_attachment_dir, sanitized_file_name)
 
@@ -641,7 +591,7 @@ def parse_email(file_path):
         analysis_results['HTML_Findings'] = html_findings
         analysis_results['Body_Content'] = (email_body[:500] + "...") if len(email_body) > 500 else email_body
 
-        # --- URL-ANALYSE ---
+        # --- URL analysis (dedup text + html URLs, then score each) ---
         combined_urls = sorted(set(extract_urls_from_text(email_body) + extracted_urls_from_html))
         url_list = []
         for url in combined_urls:
@@ -662,7 +612,6 @@ def parse_email(file_path):
             url_list.append(url_info)
         analysis_results['URLs'] = url_list
 
-        # --- KONSOLIDIERTER RISK SCORE (jetzt Teil der Ergebnisse -> auch im JSON) ---
         analysis_results['Risk_Assessment'] = compute_overall_risk(analysis_results)
 
         return analysis_results
@@ -676,7 +625,7 @@ def parse_email(file_path):
         return None
 
 
-# --- Ausgabe ---
+# --- Output ---
 
 def print_report(parsed_data, email_file):
     print("\n" + "=" * 60)
@@ -685,7 +634,6 @@ def print_report(parsed_data, email_file):
 
     h = parsed_data['Headers']
 
-    # 1. HEADER
     print("\n--- Header Information ---")
     print(f"{'Visual Sender (From):':<40} {h.get('From', 'N/A')}")
     print(f"{'Truth Sender Domain (Return-Path):':<40} {h.get('Return_Path_Domain', 'N/A')}")
@@ -712,13 +660,11 @@ def print_report(parsed_data, email_file):
     print("-" * 60)
     print(f"{'Suspicious Subject Keywords:':<40} {h.get('Suspicious_Subject_Keywords', 'N/A')}")
 
-    # 2. DECEPTIVE LINKS
     if parsed_data.get('HTML_Findings'):
         print("\n--- HTML / Deceptive Link Findings ---")
         for finding in parsed_data['HTML_Findings']:
             print(f"  - {finding}")
 
-    # 3. URLs
     print("\n--- URL Analysis ---")
     if isinstance(parsed_data.get('URLs'), list) and parsed_data['URLs']:
         for i, u in enumerate(parsed_data['URLs']):
@@ -737,7 +683,6 @@ def print_report(parsed_data, email_file):
     else:
         print("No URLs found.")
 
-    # 4. ATTACHMENTS
     print("\n--- Attachment Analysis ---")
     if parsed_data.get('Attachments'):
         for i, a in enumerate(parsed_data['Attachments']):
@@ -752,7 +697,6 @@ def print_report(parsed_data, email_file):
     else:
         print("No attachments found.")
 
-    # 5. SUMMARY
     ra = parsed_data.get('Risk_Assessment', {})
     print("\n" + "=" * 60)
     print(f"|{'Analysis Summary':^58}|")
@@ -764,7 +708,7 @@ def print_report(parsed_data, email_file):
     print("=" * 60)
 
 
-# --- Hauptteil ---
+# --- Entry point ---
 
 if __name__ == "__main__":
     email_file = ""
